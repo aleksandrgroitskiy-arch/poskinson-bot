@@ -42,7 +42,8 @@ PROVIDERS = {
     # Z.ai: GLM-Flash бесплатно, без карты; один запрос за раз
     "zai": {"base": "https://api.z.ai/api/paas/v4", "key": "ZAI_API_KEY"},
     # SambaNova: бесплатно, пока не привязан способ оплаты
-    "sambanova": {"base": "https://api.sambanova.ai/v1", "key": "SAMBANOVA_API_KEY"},
+    # 02.10.2026: на любой запрос «402 PAYMENT_METHOD_REQUIRED» — без карты не работает, отключено
+    "sambanova": {"base": "https://api.sambanova.ai/v1", "key": "SAMBANOVA_API_KEY", "disabled": True},
     # Mistral: бесплатный тариф Experiment (нужно подтвердить телефон), ~2 запроса/мин, но много токенов в месяц
     "mistral": {"base": "https://api.mistral.ai/v1", "key": "MISTRAL_API_KEY"},
     # GitHub Models закрыт 30.07.2026 — не подключать

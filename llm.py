@@ -26,9 +26,10 @@ class Router:
         self.clients = {}
         for name, p in PROVIDERS.items():
             k = key(p["key"])
-            if k:
+            if k and not p.get("disabled"):
                 self.clients[name] = httpx.AsyncClient(
-                    base_url=p["base"], timeout=90,
+                    # человек ждёт ответа: подвисший провайдер бросаем через 30 с и идём к следующему
+                    base_url=p["base"], timeout=httpx.Timeout(30, connect=8),
                     headers={"Authorization": f"Bearer {k}", **p.get("headers", {})})
         self.available = {}       # provider → set(model ids) из каталога; нет записи — каталог не прочитан
         self.resting = {}         # (provider, model) → monotonic до какого времени не трогать
@@ -191,6 +192,8 @@ class Router:
             return min(wait, 12 * 3600)
         if r.status_code == 400 and "tool_use_failed" in r.text:
             return 5                   # ошибка этого запроса, а не модели
+        if r.status_code == 402:
+            return 24 * 3600           # «нужна оплата» — на сутки
         if r.status_code in (401, 403):
             return 6 * 3600            # ключ не тот / регион — надолго
         if r.status_code == 404:
