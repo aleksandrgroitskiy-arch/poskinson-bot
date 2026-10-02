@@ -79,5 +79,12 @@ check(f"картинок не больше {config.IMAGES_PER_USER_HOUR} в ча
 check("помощь новичку распознаётся", bool(bot.HELP_RX.search("а как зайти к вам на сервер?")))
 check("айпи распознаётся", bool(bot.HELP_RX.search("скиньте айпи плз")))
 
+print("18+ картинки")
+from media import forbidden  # noqa: E402
+check("откровенное в обычном канале — нельзя", forbidden("naked woman", False))
+check("откровенное в 18+ канале — можно", not forbidden("naked woman", True))
+check("с несовершеннолетними — нельзя даже в 18+", forbidden("nude teen", True) and forbidden("sexy schoolgirl", True))
+check("жесть и «ребёнок в майне» — можно везде", not forbidden("bloody zombie", False) and not forbidden("a kid playing minecraft", False))
+
 print(f"\nитого: {ok} ✓, {fail} ✕")
 sys.exit(1 if fail else 0)

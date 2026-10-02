@@ -16,13 +16,22 @@ DESCRIBE_PROMPT = ("Опиши картинку по-русски для уча�
                    "настроение, если это мем — в чём шутка, весь текст на картинке дословно. 2–5 предложений, без вступлений.")
 
 
-# не рисуем только откровенное 18+ (и любые сексуальные сюжеты с несовершеннолетними); жестокость, кровь, хоррор — можно
+# откровенное 18+ — только в каналах Discord с отметкой 18+ (Age-Restricted); сексуальное с несовершеннолетними — нигде
 SEXUAL = re.compile(r"\b(nude|naked|nsfw|porn|sex|sexual|erotic|hentai|genital|nipple|boobs?|lingerie|undress|topless|"
                     r"orgasm|fetish|bdsm)\w*|гол(ая|ый|ые)|голышом|порно|секс|эроти|хентай|сиськ|обнажён", re.I)
 
 
-def forbidden(prompt):
-    return bool(SEXUAL.search(prompt)) or bool(re.search(r"\b(loli|shota)\b", prompt, re.I))
+MINOR = re.compile(r"\b(child|children|kid|kids|minor|loli|shota|teen|teenage|underage|young girl|young boy|schoolgirl|"
+                   r"schoolboy|little girl|little boy)\b|ребён|ребен|детск|школьни|малолет|подрост", re.I)
+
+
+def forbidden(prompt, nsfw=False):
+    """nsfw — канал отмечен 18+: тогда можно откровенное, но только со взрослыми."""
+    if re.search(r"\b(loli|shota)\b", prompt, re.I):
+        return True
+    if SEXUAL.search(prompt):
+        return not nsfw or bool(MINOR.search(prompt))
+    return False
 
 
 class Media:
@@ -68,9 +77,9 @@ class Media:
         return (m.get("content") or "").strip() or None
 
     # ---------- текст → картинка ----------
-    async def generate(self, prompt):
+    async def generate(self, prompt, nsfw=False):
         """prompt по-английски. Возвращает (bytes, имя файла, источник)."""
-        if forbidden(prompt):
+        if forbidden(prompt, nsfw):
             raise ValueError("такое не рисую")
         if CF_ACCOUNT and CF_TOKEN:
             try:

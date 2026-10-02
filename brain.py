@@ -36,7 +36,7 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "generate_image",
-        "description": "Нарисовать картинку, когда просят нарисовать/сгенерировать/показать картинку. Картинка приложится к твоему ответу. Не рисуешь только откровенное 18+ (сексуальное) — откажи в своём стиле; жесть, кровь, хоррор, мемы — можно.",
+        "description": "Нарисовать картинку, когда просят нарисовать/сгенерировать/показать картинку. Картинка приложится к твоему ответу. Откровенное 18+ — только если в подсказке сказано, что это 18+ канал (и только взрослые персонажи); иначе откажи в своём стиле. Жесть, кровь, хоррор, мемы — можно везде.",
         "parameters": {"type": "object", "properties": {
             "prompt_en": {"type": "string", "description": "Подробное описание картинки НА АНГЛИЙСКОМ: объект, стиль, детали"}},
             "required": ["prompt_en"]}}},
@@ -176,9 +176,10 @@ class Brain:
                 if not prompt:
                     return "нужно описание"
                 try:
-                    data, fname, src = await self.media.generate(prompt)
+                    data, fname, src = await self.media.generate(prompt, nsfw=ctx.get("nsfw", False))
                 except ValueError:
-                    return "такое не рисую (18+) — откажи в своём стиле"
+                    return ("такое не рисую (только в 18+ канале и только взрослые) — откажи в своём стиле"
+                            if not ctx.get("nsfw") else "с несовершеннолетними — никогда, откажи жёстко")
                 ctx.setdefault("files", []).append((data, fname))
                 return f"картинка готова ({src}) и будет приложена к ответу, просто прокомментируй её"
             if name == "send_gif":

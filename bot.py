@@ -381,6 +381,20 @@ def is_called(m):
     return bool(CALL_RX.search(m.content) or CALL_RX.search(transcripts.get(m.id, "")))
 
 
+def is_nsfw(channel):
+    """Канал отмечен в Discord как 18+ (Age-Restricted)."""
+    try:
+        return bool(channel.is_nsfw())
+    except AttributeError:
+        return False
+
+
+NSFW_NOTE = ("\n\nЭто 18+ канал (все взрослые): откровенные сексуальные шутки, темы и картинки (generate_image) разрешены. "
+             "Только взрослые: ничего сексуального с несовершеннолетними.")
+SFW_NOTE = ("\n\nОбычный канал: пошлые шутки можно, но откровенный сексуальный контент и такие картинки — только в 18+ "
+            "каналах (скажи, чтобы шли туда).")
+
+
 def is_newbie(member):
     joined = getattr(member, "joined_at", None)
     return bool(joined) and (datetime.now(joined.tzinfo) - joined).days < 3
@@ -401,6 +415,8 @@ async def build_prompt(m, interject, with_kb=False):
               + memory.prompt_block(gid, m.channel.id if m.guild else None, people, specials(users.values()), with_kb=with_kb))
     if m.guild and is_newbie(m.author):
         system += f"\n\n{m.author.display_name} — новичок на сервере (зашёл недавно): помоги нормально, без жёсткой прожарки."
+    if m.guild:
+        system += NSFW_NOTE if is_nsfw(m.channel) else SFW_NOTE
     if interject:
         system += "\n\n" + INTERJECT_NOTE
     # недавний чат — одним блоком (контекст), а сообщение, на которое отвечаем, — отдельно и явно:
@@ -419,7 +435,7 @@ async def respond(m, called, interject):
     started = time.monotonic()
     ctx = {"channel_id": m.channel.id, "user_id": m.author.id, "guild_id": m.guild.id if m.guild else 0,
            "image_ok": image_ok, "kb": memory.kb(m.guild.id)[0] if m.guild else "",
-           "text": m.content + " " + transcripts.get(m.id, "")}
+           "text": m.content + " " + transcripts.get(m.id, ""), "nsfw": is_nsfw(m.channel)}
     try:
         async with m.channel.typing():
             await see_images(m)
@@ -673,7 +689,12 @@ async def c_draw(inter: discord.Interaction, что: str):
                                     f"картинок (объект, стиль, детали, 1–2 предложения), только описание: {что}"}],
                                   role="light", max_tokens=200, temperature=0.4)
         prompt = (m.get("content") or что).strip().strip('"')
-        data, name, src = await media.generate(prompt)
+        try:
+            data, name, src = await media.generate(prompt, nsfw=is_nsfw(inter.channel))
+        except ValueError:
+            await inter.followup.send("такое рисую только в 18+ канале и только со взрослыми" if not is_nsfw(inter.channel)
+                                      else "с несовершеннолетними — никогда. иди нахуй")
+            return
         comment = await say(gid(inter), {inter.user.id: inter.user.display_name},
                             f"{inter.user.display_name} попросил нарисовать: «{что}». Картинка готова. "
                             "Одной короткой едкой фразой прокомментируй его запрос.", max_tokens=120)
