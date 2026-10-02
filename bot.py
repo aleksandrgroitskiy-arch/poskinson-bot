@@ -25,7 +25,7 @@ from discord.ext import tasks
 from brain import Brain, RateLimited, fix_script
 from config import (CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
                     JUDGE_PROMPT, JUDGE_THRESHOLD, LOG_DIR, LOH_HOUR, MAX_PARTS, NAME, PERSONA, QUIZ_SECONDS,
-                    REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
+                    REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SPLIT_CHANCE, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
                     SUMMARY_EVERY, SUMMARY_IDLE, TOKEN, TYPING_CPS, TYPING_MAX, TZ, VERSION)
 from llm import Router
 from media import Media
@@ -54,7 +54,7 @@ pending = {}            # channel_id → сколько сообщений с п
 last_activity = {}      # channel_id → время последнего сообщения
 consolidating = set()   # карточки, которые сейчас пересобираются
 quizzes = {}            # channel_id → активная викторина
-FACT_RX = re.compile(r"^\s*ЗАПОМНИ:\s*(.+?)\s*\|\s*(.+?)\s*$", re.M)
+FACT_RX = re.compile(r"^\s*(?:-{3,}\s*)?ЗАПОМНИ\s*:\s*(.+?)\s*\|\s*(.+?)\s*$", re.M | re.I)
 TIRED = "мана кончилась, дай реген пару минут"
 MENTIONS = discord.AllowedMentions(users=True, everyone=False, roles=False)
 
@@ -77,9 +77,10 @@ def emoji_block(guild):
     st = [s.name for s in guild.stickers][:20]
     out = ""
     if em:
-        out += "\nЭмодзи сервера: " + " ".join(em)
+        out += "\n- Можешь изредка вставлять эмодзи сервера (только эти, другие не выдумывай): " + " ".join(em)
     if st:
-        out += "\nСтикеры сервера: " + ", ".join(st)
+        out += ("\n- Совсем изредка можешь отправить стикер сервера строкой [стикер: имя] в конце ответа "
+                "(только эти): " + ", ".join(st))
     return out
 
 
@@ -168,7 +169,7 @@ async def send_long(channel, text, reference=None):
 
 
 STICKER_RX = re.compile(r"\[стикер:\s*([^\]]+)\]", re.I)
-EMOJI_RX = re.compile(r"(?<![<\w]):([A-Za-z0-9_]{2,32}):(?!\d)")
+EMOJI_RX = re.compile(r"(?<![<\w]):([\wА-Яа-яЁё]{2,32}):(?!\d)")
 PART_RX = re.compile(r"\n?\s*^-{3,}\s*$\s*\n?", re.M)
 
 
@@ -185,8 +186,13 @@ async def send_reply(channel, text, reference=None, started=None, files=(), gif=
             sticker = next((s for s in guild.stickers if s.name.lower() == name), None)
     if guild:
         emap = {e.name: str(e) for e in guild.emojis if e.available}
-        text = EMOJI_RX.sub(lambda x: emap.get(x.group(1), x.group(0)), text)
+    else:
+        emap = {}
+    # эмодзи сервера → настоящие, выдуманные (:смех:) → вон
+    text = EMOJI_RX.sub(lambda x: emap.get(x.group(1), ""), text).strip()
     parts = [p.strip() for p in PART_RX.split(text) if p.strip()]
+    if len(parts) > 1 and random.random() > SPLIT_CHANCE:
+        parts = ["\n".join(parts)]               # модели злоупотребляют «---»: чаще — одним сообщением
     if len(parts) > MAX_PARTS:
         parts = parts[:MAX_PARTS - 1] + ["\n".join(parts[MAX_PARTS - 1:])]
     if not parts and not files:
