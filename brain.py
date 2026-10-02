@@ -1,4 +1,4 @@
-"""Groq: чат с инструментами (поиск, страницы, напоминания), распознавание голосовых."""
+"""Чат с инструментами: поиск, страницы, напоминания, картинки, гифки. Модели — через llm.Router."""
 import asyncio
 import html
 import json
@@ -8,7 +8,8 @@ from datetime import datetime
 
 import httpx
 
-from config import CHAT_MODELS, GROQ_KEY, TZ, VOICE_MODEL
+from config import TZ
+from llm import RateLimited  # noqa: F401 — реэкспорт для bot.py
 
 log = logging.getLogger("poskinson.brain")
 
@@ -33,48 +34,31 @@ TOOLS = [
         "name": "list_reminders",
         "description": "Показать активные напоминания человека, который спрашивает.",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "generate_image",
+        "description": "Нарисовать картинку, когда просят нарисовать/сгенерировать/показать картинку. Картинка приложится к твоему ответу.",
+        "parameters": {"type": "object", "properties": {
+            "prompt_en": {"type": "string", "description": "Подробное описание картинки НА АНГЛИЙСКОМ: объект, стиль, детали"}},
+            "required": ["prompt_en"]}}},
+    {"type": "function", "function": {
+        "name": "send_gif",
+        "description": "Отправить гифку-реакцию после ответа. Используй изредка, когда гифка реально смешнее слов.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Что искать, 1–3 слова по-английски (например: facepalm, crying laughing)"}},
+            "required": ["query"]}}},
 ]
 
 
-class RateLimited(Exception):
-    pass
-
-
 class Brain:
-    def __init__(self, store):
+    def __init__(self, store, router, media):
         self.store = store
-        self.http = httpx.AsyncClient(base_url="https://api.groq.com/openai/v1",
-                                      headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=90)
+        self.router = router
+        self.media = media
         self.web = httpx.AsyncClient(timeout=15, follow_redirects=True,
                                      headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) poskinson"})
-        self.blocked = {}   # model → до какого времени упёрлась в лимит
 
-    # ---------- один запрос с перебором моделей ----------
-    async def complete(self, messages, models=CHAT_MODELS, tools=None, max_tokens=900, temperature=0.75, json_mode=False):
-        last = None
-        loop = asyncio.get_running_loop()
-        for model in models:
-            if self.blocked.get(model, 0) > loop.time():
-                continue
-            body = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-            body["reasoning_effort"] = "none" if model.startswith("qwen/") else "low"
-            if tools:
-                body["tools"] = tools
-            if json_mode:
-                body["response_format"] = {"type": "json_object"}
-            try:
-                r = await self.http.post("/chat/completions", json=body)
-            except httpx.HTTPError as e:
-                last = f"сеть: {e!r}"
-                continue
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]
-            last = f"{model}: HTTP {r.status_code} {r.text[:200]}"
-            log.warning(last)
-            if r.status_code == 429:
-                wait = float(r.headers.get("retry-after") or 30)
-                self.blocked[model] = loop.time() + min(wait, 3600)
-        raise RateLimited(last or "все модели в лимите")
+    async def complete(self, messages, role="chat", **kw):
+        return await self.router.complete(messages, role=role, **kw)
 
     # ---------- ответ в чат с инструментами ----------
     async def chat(self, messages, ctx):
@@ -91,6 +75,7 @@ class Brain:
         msgs = list(messages)
         for _ in range(4):
             m = await self.complete(msgs, tools=TOOLS)
+            ctx["model"] = m.get("_model")
             calls = m.get("tool_calls") or []
             if not calls:
                 return clean_text(m.get("content") or "")
@@ -114,6 +99,19 @@ class Brain:
                 return await self.open_page(args.get("url", ""))
             if name == "set_reminder":
                 return self.set_reminder(args, ctx)
+            if name == "generate_image":
+                prompt = (args.get("prompt_en") or "").strip()
+                if not prompt:
+                    return "нужно описание"
+                data, fname, src = await self.media.generate(prompt)
+                ctx.setdefault("files", []).append((data, fname))
+                return f"картинка готова ({src}) и будет приложена к ответу, просто прокомментируй её"
+            if name == "send_gif":
+                url = await self.media.gif(args.get("query") or "")
+                if not url:
+                    return "гифки сейчас недоступны, обойдись словами"
+                ctx["gif"] = url
+                return "гифка будет отправлена после твоего ответа"
             if name == "list_reminders":
                 rows = self.store.user_reminders(ctx["user_id"])
                 if not rows:
@@ -164,15 +162,6 @@ class Brain:
         text = re.sub(r"(?s)<[^>]+>", " ", text)
         text = html.unescape(re.sub(r"\s+", " ", text)).strip()
         return text[:3000] or "страница пустая"
-
-    # ---------- голосовые ----------
-    async def transcribe(self, data, filename="voice.ogg"):
-        r = await self.http.post("/audio/transcriptions",
-                                 files={"file": (filename, data, "audio/ogg")},
-                                 data={"model": VOICE_MODEL, "language": "ru", "response_format": "json"})
-        if r.status_code != 200:
-            raise RuntimeError(f"whisper: HTTP {r.status_code} {r.text[:200]}")
-        return (r.json().get("text") or "").strip()
 
 
 CJK = re.compile(r"[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff00-\uffef]+")

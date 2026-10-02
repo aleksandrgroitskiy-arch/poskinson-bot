@@ -1,13 +1,16 @@
-"""poskinson — грубый Discord-бот для развлечения (Groq, бесплатный тариф).
+"""poskinson — грубый Discord-бот для развлечения (бесплатные нейросети нескольких провайдеров).
 
-Отвечает, когда зовут (упоминание, ответ ему, имя, личка), иногда сам влезает;
-слушает голосовые; ищет в интернете; ставит напоминания; помнит людей (SQLite) и
-при появлении на сервере читает историю каналов, чтобы узнать, кто есть кто.
-Развлечения — slash-команды: /лохдня /дуэль /рулетка /кости /шар /викторина /очки
-/прожарка /анекдот /совет /заткнись /говори /напоминания /отменить /чтознаешь /забудь /помощь.
-Характер и настройки — config.py, ключи — .env.
+Отвечает, когда зовут (упоминание, ответ ему, имя, личка); сам влезает, когда нейросеть-судья
+видит повод; слушает голосовые и видит картинки; рисует; кидает гифки, эмодзи и стикеры сервера;
+пишет с паузами «на печать» и иногда несколькими сообщениями; ищет в интернете; ставит напоминания.
+Память — слоями (memory.py): карточки людей и лор сервера, свежие факты, сводки каналов, хронология.
+Slash-команды: /лохдня /дуэль /рулетка /кости /шар /викторина /очки /прожарка /анекдот /совет /нарисуй
+/заткнись /говори /напоминания /отменить /чтознаешь /забудь /статистика /помощь /лохдня_тут.
+Файлы: config.py (характер, модели, настройки), llm.py (маршрутизатор моделей), media.py, memory.py,
+store.py (SQLite), brain.py (инструменты). Ключи — .env. Логи — logs/, копии памяти — backups/.
 """
 import asyncio
+import io
 import json
 import logging
 import random
@@ -20,9 +23,13 @@ from discord import app_commands
 from discord.ext import tasks
 
 from brain import Brain, RateLimited, fix_script
-from config import (CALL_RX, HISTORY, INTERJECT_CHANCE, INTERJECT_COOLDOWN, INTERJECT_NOTE, LOH_HOUR, NAME,
-                    PERSONA, QUIZ_SECONDS, REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SCAN_CHUNK_CHARS,
-                    SCAN_LIMIT, SCAN_MODELS, SCAN_PAUSE, SCAN_PROMPT, TOKEN, TZ, VOICE_REPLY_CHANCE, DB_PATH)
+from config import (CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
+                    JUDGE_PROMPT, JUDGE_THRESHOLD, LOG_DIR, LOH_HOUR, MAX_PARTS, NAME, PERSONA, QUIZ_SECONDS,
+                    REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
+                    SUMMARY_EVERY, SUMMARY_IDLE, TOKEN, TYPING_CPS, TYPING_MAX, TZ, VERSION)
+from llm import Router
+from media import Media
+from memory import Memory
 from store import Store
 
 log = logging.getLogger("poskinson")
@@ -32,12 +39,20 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 store = Store(DB_PATH)
-brain = Brain(store)
+router = Router(store.db)
+media = Media(router)
+memory = Memory(store, router)
+brain = Brain(store, router, media)
 
 last_interject = {}     # channel_id → время последнего вмешательства
 muted_until = {}        # channel_id → до какого времени молчит сам
 last_channel = {}       # guild_id → последний живой канал (для «лоха дня»)
 transcripts = {}        # message_id → текст голосового
+images = {}             # message_id → описание картинок
+last_judge = {}         # channel_id → когда последний раз спрашивали судью
+pending = {}            # channel_id → сколько сообщений с последней сводки
+last_activity = {}      # channel_id → время последнего сообщения
+consolidating = set()   # карточки, которые сейчас пересобираются
 quizzes = {}            # channel_id → активная викторина
 FACT_RX = re.compile(r"^\s*ЗАПОМНИ:\s*(.+?)\s*\|\s*(.+?)\s*$", re.M)
 TIRED = "мана кончилась, дай реген пару минут"
@@ -55,39 +70,88 @@ def muted(channel_id):
     return muted_until.get(channel_id, 0) > time.time()
 
 
-def memory_block(guild_id, people):
-    lines = []
-    for uid, name in people.items():
-        f = store.facts(uid)
-        if f:
-            lines.append(f"{name}: " + "; ".join(f))
-    if guild_id:
-        sf = store.server_facts(guild_id)
-        if sf:
-            lines.append("Сервер (общие мемы): " + "; ".join(sf))
-    return "Память о людях в чате:\n" + ("\n".join(lines) or "(пока ничего)")
+def emoji_block(guild):
+    if not guild:
+        return ""
+    em = [f":{e.name}:" for e in guild.emojis if e.available][:40]
+    st = [s.name for s in guild.stickers][:20]
+    out = ""
+    if em:
+        out += "\nЭмодзи сервера: " + " ".join(em)
+    if st:
+        out += "\nСтикеры сервера: " + ", ".join(st)
+    return out
 
 
 def save_facts(text, people, guild_id):
+    """Вырезает строки «ЗАПОМНИ: …», кладёт факты в память, при надобности пересобирает карточки."""
     by_name = {n.lower(): uid for uid, n in people.items()}
     for name, fact in FACT_RX.findall(text):
         key = name.strip().lstrip("@").lower()
         if key == "сервер" and guild_id:
-            if store.add_fact(0, "сервер", fact, guild_id):
+            new, due = memory.add_fact(0, "сервер", fact, guild_id)
+            if new:
                 log.info("запомнил о сервере: %s", fact)
+            if due:
+                schedule_consolidation(0, guild_id, "сервер")
         elif key in by_name:
-            if store.add_fact(by_name[key], name.strip(), fact, guild_id or 0):
+            new, due = memory.add_fact(by_name[key], name.strip(), fact, guild_id or 0)
+            if new:
                 log.info("запомнил: %s | %s", name, fact)
+            if due:
+                schedule_consolidation(by_name[key], 0, name.strip())
     return FACT_RX.sub("", text).strip()
+
+
+def schedule_consolidation(uid, gid, name):
+    k = (uid, gid)
+    if k in consolidating:
+        return
+    consolidating.add(k)
+
+    async def run():
+        try:
+            await memory.consolidate(uid, gid, name)
+        finally:
+            consolidating.discard(k)
+    asyncio.create_task(run())
+
+
+def image_atts(m):
+    return [a for a in m.attachments if (a.content_type or "").startswith("image/")][:2]
 
 
 def msg_text(m):
     text = m.clean_content
     if m.id in transcripts:
         text = (text + " " if text else "") + f"[голосовое: {transcripts[m.id]}]"
-    elif m.attachments:
-        text += " [вложение: " + ", ".join(a.filename for a in m.attachments) + "]"
-    return text
+    imgs = image_atts(m)
+    if imgs:
+        text += f" [картинка: {images[m.id]}]" if m.id in images else " [картинка]"
+    other = [a.filename for a in m.attachments if a not in imgs and m.id not in transcripts]
+    if other:
+        text += " [вложение: " + ", ".join(other) + "]"
+    if m.stickers:
+        text += " [стикер: " + ", ".join(s.name for s in m.stickers) + "]"
+    return text.strip()
+
+
+async def see_images(m):
+    """Описать картинки сообщения (один раз, с кешем)."""
+    if m.id in images or not image_atts(m):
+        return
+    notes = []
+    for a in image_atts(m):
+        url = a.proxy_url + ("&" if "?" in a.proxy_url else "?") + "width=1024&height=1024"
+        d = await media.describe(url, m.clean_content[:200])
+        if d:
+            notes.append(d)
+    if notes:
+        images[m.id] = " / ".join(notes)
+        log.info("картинка от %s: %s", m.author.display_name, images[m.id][:100])
+        if len(images) > 300:
+            for k in list(images)[:60]:
+                images.pop(k, None)
 
 
 def is_voice(m):
@@ -103,9 +167,63 @@ async def send_long(channel, text, reference=None):
         await channel.send(c, reference=reference if i == 0 else None, mention_author=False, allowed_mentions=MENTIONS)
 
 
+STICKER_RX = re.compile(r"\[стикер:\s*([^\]]+)\]", re.I)
+EMOJI_RX = re.compile(r"(?<![<\w]):([A-Za-z0-9_]{2,32}):(?!\d)")
+PART_RX = re.compile(r"\n?\s*^-{3,}\s*$\s*\n?", re.M)
+
+
+async def send_reply(channel, text, reference=None, started=None, files=(), gif=None):
+    """Как человек: пауза «на печать», ответ может быть несколькими сообщениями,
+    эмодзи :имя: → эмодзи сервера, [стикер: имя] → стикер, картинки и гифка — следом."""
+    guild = getattr(channel, "guild", None)
+    sticker = None
+    m = STICKER_RX.search(text)
+    if m:
+        text = STICKER_RX.sub("", text).strip()
+        if guild:
+            name = m.group(1).strip().lower()
+            sticker = next((s for s in guild.stickers if s.name.lower() == name), None)
+    if guild:
+        emap = {e.name: str(e) for e in guild.emojis if e.available}
+        text = EMOJI_RX.sub(lambda x: emap.get(x.group(1), x.group(0)), text)
+    parts = [p.strip() for p in PART_RX.split(text) if p.strip()]
+    if len(parts) > MAX_PARTS:
+        parts = parts[:MAX_PARTS - 1] + ["\n".join(parts[MAX_PARTS - 1:])]
+    if not parts and not files:
+        parts = ["…"]
+    started = started or time.monotonic()
+    for i, part in enumerate(parts):
+        delay = min(TYPING_MAX, 0.6 + len(part) / TYPING_CPS)
+        if i == 0:
+            delay -= time.monotonic() - started      # пока думал — уже «печатал»
+        if delay > 0.3:
+            async with channel.typing():
+                await asyncio.sleep(delay)
+        last = i == len(parts) - 1
+        chunks = [part[k:k + 1900] for k in range(0, len(part), 1900)]
+        for k, c in enumerate(chunks):
+            kw = {}
+            if files and last and k == len(chunks) - 1:
+                kw["files"] = [discord.File(io.BytesIO(d), filename=n) for d, n in files]
+            await channel.send(c, reference=reference if i == 0 and k == 0 else None, mention_author=False,
+                               allowed_mentions=MENTIONS, **kw)
+    if not parts and files:
+        await channel.send(files=[discord.File(io.BytesIO(d), filename=n) for d, n in files], reference=reference,
+                           mention_author=False)
+    if gif:
+        await asyncio.sleep(0.8)
+        await channel.send(gif)
+    if sticker:
+        try:
+            await channel.send(stickers=[sticker])
+        except discord.HTTPException:
+            pass
+
+
 async def say(guild_id, people, instruction, max_tokens=500):
     """Короткая реплика в характере по заданию (для команд и событий)."""
-    system = PERSONA + "\n" + now_line() + "\n" + memory_block(guild_id, people)
+    system = PERSONA + "\n" + now_line() + "\n" + memory.prompt_block(guild_id, None, people)
+    system += "\n\nСейчас ответ уходит одним сообщением: не используй разделитель ---, стикеры и гифки."
     m = await brain.complete([{"role": "system", "content": system}, {"role": "user", "content": instruction}],
                              max_tokens=max_tokens)
     return fix_script(save_facts(m.get("content") or "", people, guild_id))
@@ -138,7 +256,8 @@ async def build_prompt(m, interject):
             people[x.author.id] = x.author.display_name
     gid = m.guild.id if m.guild else 0
     where = f"Канал #{m.channel.name}." if m.guild else "Личные сообщения."
-    system = PERSONA + "\n" + now_line() + " " + where + "\n" + memory_block(gid, people)
+    system = (PERSONA + emoji_block(m.guild) + "\n" + now_line() + " " + where + "\n"
+              + memory.prompt_block(gid, m.channel.id if m.guild else None, people))
     if interject:
         system += "\n\n" + INTERJECT_NOTE
     msgs = [{"role": "system", "content": system}]
@@ -152,10 +271,16 @@ async def build_prompt(m, interject):
 
 
 async def respond(m, called, interject):
+    started = time.monotonic()
+    ctx = {"channel_id": m.channel.id, "user_id": m.author.id}
     try:
         async with m.channel.typing():
+            await see_images(m)
+            ref = m.reference.resolved if m.reference else None
+            if isinstance(ref, discord.Message):
+                await see_images(ref)
             msgs, people = await build_prompt(m, interject)
-            answer = await brain.chat(msgs, {"channel_id": m.channel.id, "user_id": m.author.id})
+            answer = await brain.chat(msgs, ctx)
     except RateLimited:
         log.warning("лимит Groq")
         if called:
@@ -167,9 +292,11 @@ async def respond(m, called, interject):
             await m.reply("чёт я завис, повтори", mention_author=False)
         return
     answer = save_facts(answer, people, m.guild.id if m.guild else 0)
-    if not answer or "[молчу]" in answer:
+    if "[молчу]" in answer or (not answer and not ctx.get("files")):
         return
-    await send_long(m.channel, answer, reference=m if called else None)
+    log.info("ответ %s (%s) в #%s", "по зову" if called else "сам", ctx.get("model"), getattr(m.channel, "name", "лс"))
+    await send_reply(m.channel, answer, reference=m if called else None, started=started,
+                     files=ctx.get("files", ()), gif=ctx.get("gif"))
 
 
 async def handle_voice(m):
@@ -178,7 +305,7 @@ async def handle_voice(m):
         return False
     try:
         data = await att.read()
-        text = await brain.transcribe(data, att.filename or "voice.ogg")
+        text = await media.transcribe(data, att.filename or "voice.ogg")
     except Exception:
         log.exception("голосовое не распозналось")
         return False
@@ -230,6 +357,9 @@ async def on_message(m):
     if m.guild and await check_quiz(m):
         return
 
+    if m.guild:
+        pending[m.channel.id] = pending.get(m.channel.id, 0) + 1
+        last_activity[m.channel.id] = time.time()
     voice = is_voice(m) and await handle_voice(m)
     called = is_called(m)
     interject = False
@@ -237,12 +367,13 @@ async def on_message(m):
         if muted(m.channel.id):
             return
         now = time.time()
-        if voice and random.random() < VOICE_REPLY_CHANCE:
-            interject = True
-        elif (now - last_interject.get(m.channel.id, 0) > INTERJECT_COOLDOWN
-              and random.random() < INTERJECT_CHANCE and len(m.content) > 15):
-            interject = True
-            last_interject[m.channel.id] = now
+        ch = m.channel.id
+        if (now - last_interject.get(ch, 0) > INTERJECT_COOLDOWN and now - last_judge.get(ch, 0) > JUDGE_COOLDOWN
+                and (voice or image_atts(m) or (len(m.content) > 8 and random.random() < JUDGE_CHANCE))):
+            last_judge[ch] = now
+            if await worth_it(m):
+                interject = True
+                last_interject[ch] = now
         if not interject:
             if random.random() < REACT_CHANCE:
                 try:
@@ -253,13 +384,31 @@ async def on_message(m):
     await respond(m, called, interject)
 
 
+async def worth_it(m):
+    """Нейросеть-судья: есть ли повод влезть. Дешёвая модель, ответ — оценка 0–10."""
+    try:
+        hist = [x async for x in m.channel.history(limit=8, before=m)]
+        hist.reverse()
+        hist.append(m)
+        lines = "\n".join(f"{'(бот) ' if x.author == client.user else ''}{x.author.display_name}: {msg_text(x)[:300]}" for x in hist)
+        r = await router.complete([{"role": "system", "content": JUDGE_PROMPT}, {"role": "user", "content": lines}],
+                                  role="light", max_tokens=120, temperature=0, json_mode=True)
+        data = json.loads(r.get("content") or "{}")
+        score = float(data.get("score", 0))
+    except Exception as e:
+        log.debug("судья молчит: %r", e)
+        return False
+    log.info("судья: %.0f/10 в #%s — %s", score, m.channel.name, str(data.get("why", ""))[:80])
+    return score >= JUDGE_THRESHOLD
+
+
 def what_i_know(uid):
-    f = store.facts(uid, limit=30)
-    return ("я про тебя помню:\n- " + "\n- ".join(f)) if f else "про тебя я ничего не помню, ты пустое место"
+    t = memory.about(uid)
+    return ("вот что я про тебя знаю:\n" + t) if t else "про тебя я ничего не помню, ты пустое место"
 
 
 def forget_text(uid):
-    return f"стёр {store.forget(uid)} фактов о тебе. ты снова никто"
+    return f"стёр {memory.forget(uid)} фактов о тебе. ты снова никто"
 
 
 # ======================= slash-команды =======================
@@ -284,11 +433,12 @@ def gid(inter):
 async def c_help(inter: discord.Interaction):
     await inter.response.send_message(
         f"**{NAME}** — зови по имени, упоминанием или ответом на моё сообщение, в личке отвечаю всегда. "
-        "Иногда сам влезаю в разговор, слушаю голосовые, умею гуглить и ставить напоминания "
+        "Сам влезаю, когда есть повод, слушаю голосовые, вижу картинки, рисую, гуглю и ставлю напоминания "
         "(«поскинсон, напомни через 2 часа…»).\n"
         "**Игры:** /лохдня, /дуэль, /рулетка, /кости, /шар, /викторина, /очки\n"
-        "**Болтовня:** /прожарка, /анекдот, /совет\n"
-        "**Служебное:** /заткнись, /говори, /напоминания, /отменить, /чтознаешь, /забудь, /лохдня_тут",
+        "**Болтовня:** /прожарка, /анекдот, /совет, /нарисуй\n"
+        "**Служебное:** /заткнись, /говори, /напоминания, /отменить, /чтознаешь, /забудь, /лохдня_тут, /статистика\n"
+        f"версия {VERSION}",
         ephemeral=True)
 
 
@@ -319,6 +469,36 @@ async def c_roast(inter: discord.Interaction, кого: discord.Member):
                              f"{inter.user.display_name} просит прожарить {кого.display_name}. Жёстко прожарь "
                              f"{кого.display_name} в 2–4 предложениях, используя то, что о нём знаешь. "
                              f"Обращайся к нему как <@{кого.id}>."))
+
+
+@tree.command(name="нарисуй", description="Нарисовать картинку")
+@app_commands.describe(что="Что нарисовать (можно по-русски)")
+async def c_draw(inter: discord.Interaction, что: str):
+    await inter.response.defer(thinking=True)
+    try:
+        m = await router.complete([{"role": "user", "content": "Переведи на английский и подробно опиши для генератора "
+                                    f"картинок (объект, стиль, детали, 1–2 предложения), только описание: {что}"}],
+                                  role="light", max_tokens=200, temperature=0.4)
+        prompt = (m.get("content") or что).strip().strip('"')
+        data, name, src = await media.generate(prompt)
+        comment = await say(gid(inter), {inter.user.id: inter.user.display_name},
+                            f"{inter.user.display_name} попросил нарисовать: «{что}». Картинка готова. "
+                            "Одной короткой едкой фразой прокомментируй его запрос.", max_tokens=120)
+        await inter.followup.send(comment[:1900] or "на, любуйся", file=discord.File(io.BytesIO(data), filename=name))
+    except Exception:
+        log.exception("нарисуй")
+        await inter.followup.send("кисточка сломалась, попробуй позже")
+
+
+@tree.command(name="статистика", description="Расход нейросетей за сегодня (видишь только ты)")
+async def c_stats(inter: discord.Interaction):
+    rows = router.report()
+    lines = [f"`{p}:{m}` — {req} запр., ошибок {err}, токенов {ti}+{to}" for p, m, req, err, ti, to in rows]
+    roles = {r: len(router.candidates(r)) for r in ("chat", "light", "vision")}
+    await inter.response.send_message(
+        f"**poskinson {VERSION}**, провайдеры: {', '.join(router.clients) or 'нет'}\n"
+        f"доступно моделей сейчас — болтовня: {roles['chat']}, служебных: {roles['light']}, зрение: {roles['vision']}\n"
+        + ("\n".join(lines) or "сегодня ещё ничего не тратил"), ephemeral=True)
 
 
 @tree.command(name="кости", description="Бросить кости, например 2d6 или 1d20+3")
@@ -654,8 +834,8 @@ async def scan_channel(guild, ch):
         r = None
         for _ in range(4):
             try:
-                r = await brain.complete([{"role": "system", "content": SCAN_PROMPT}, {"role": "user", "content": text}],
-                                         models=SCAN_MODELS, max_tokens=1200, temperature=0.3)
+                r = await router.complete([{"role": "system", "content": SCAN_PROMPT}, {"role": "user", "content": text}],
+                                          role="light", max_tokens=1200, temperature=0.3)
                 break
             except RateLimited:
                 await asyncio.sleep(90)
@@ -668,14 +848,71 @@ async def scan_channel(guild, ch):
             who, fact = (s.strip() for s in line.split("|", 1))
             who = who.strip("-•* @").lower()
             if who == "сервер":
-                added += store.add_fact(0, "сервер", fact, guild.id)
+                added += memory.add_fact(0, "сервер", fact, guild.id)[0]
             elif who in names:
-                added += store.add_fact(names[who], who, fact, guild.id)
+                added += memory.add_fact(names[who], who, fact, guild.id)[0]
         log.info("#%s: кусок %d/%d, новых фактов: %d", ch.name, i + 1, len(chunks), added)
         if i + 1 < len(chunks):
             await asyncio.sleep(SCAN_PAUSE)
+    # сводка канала по последним сообщениям — чтобы сразу знать, о чём тут говорят
+    tail = msgs[-120:]
+    if tail:
+        await memory.summarize(ch.id, guild.id, ch.name, [f"{m.author.display_name}: {m.clean_content[:300]}" for m in tail],
+                               tail[-1].id)
     store.mark_scanned(ch.id)
     log.info("#%s прочитан: %d сообщений, %d новых фактов", ch.name, len(msgs), added)
+    if added:
+        await consolidate_all()
+
+
+async def consolidate_all():
+    """Пересобрать карточки всех, у кого есть несжатые факты (по одной, с паузами — лимиты)."""
+    for uid, gid, name in memory.needing_consolidation():
+        k = (uid, gid) if not uid else (uid, 0)
+        if k in consolidating:
+            continue
+        consolidating.add(k)
+        try:
+            await memory.consolidate(uid, gid, name)
+        finally:
+            consolidating.discard(k)
+        await asyncio.sleep(5)
+
+
+@tasks.loop(minutes=2)
+async def summary_loop():
+    """Сводки каналов: каждые SUMMARY_EVERY сообщений или после паузы, если накопилось ≥ 5."""
+    now = time.time()
+    for cid, n in list(pending.items()):
+        idle = now - last_activity.get(cid, now)
+        if not (n >= SUMMARY_EVERY or (n >= 5 and idle >= SUMMARY_IDLE)):
+            continue
+        ch = client.get_channel(cid)
+        if not ch or not getattr(ch, "guild", None):
+            pending.pop(cid, None)
+            continue
+        _, last_id, _ = memory.channel(cid)
+        after = discord.Object(id=last_id) if last_id else None
+        msgs = [m async for m in ch.history(limit=150, after=after, oldest_first=True) if m.content or m.attachments]
+        if not msgs:
+            pending[cid] = 0
+            continue
+        lines = [f"{'(бот) ' if m.author == client.user else ''}{m.author.display_name}: {msg_text(m)[:300]}" for m in msgs]
+        if await memory.summarize(cid, ch.guild.id, ch.name, lines, msgs[-1].id):
+            pending[cid] = 0
+
+
+@tasks.loop(minutes=10)
+async def maintenance_loop():
+    """Ночью (4–5 утра по Москве): каталоги моделей, пересборка карточек, копия памяти."""
+    n = datetime.now(TZ)
+    if n.hour != 4 or store.get(0, "maintenance") == n.date().isoformat():
+        return
+    store.put(0, "maintenance", n.date().isoformat())
+    log.info("ночное обслуживание")
+    await router.discover()
+    await consolidate_all()
+    memory.backup()
 
 
 @tasks.loop(hours=1)
@@ -699,7 +936,17 @@ async def on_ready():
     log.info("вошёл как %s, серверов: %d", client.user, len(client.guilds))
     for guild in client.guilds:
         await sync_commands(guild)
-    for loop in (loh_loop, reminder_loop, scan_loop):
+    if not getattr(client, "_booted", False):
+        client._booted = True
+        log.info("poskinson %s", VERSION)
+        await router.discover()
+        if not (memory.db.execute("SELECT 1 FROM profiles LIMIT 1").fetchone()):
+            asyncio.create_task(consolidate_all())       # первая сборка карточек из старых фактов
+        try:
+            memory.backup()
+        except Exception:
+            log.exception("копия памяти")
+    for loop in (loh_loop, reminder_loop, scan_loop, summary_loop, maintenance_loop):
         if not loop.is_running():
             loop.start()
 
@@ -712,7 +959,11 @@ async def on_guild_join(guild):
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from logging.handlers import RotatingFileHandler
+    LOG_DIR.mkdir(exist_ok=True)
+    fh = RotatingFileHandler(LOG_DIR / "bot.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        handlers=[logging.StreamHandler(), fh])
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("discord.gateway").setLevel(logging.WARNING)
     logging.getLogger("primp").setLevel(logging.WARNING)
