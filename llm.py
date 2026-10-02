@@ -1,5 +1,6 @@
 """Маршрутизатор нейросетей: перебирает модели всех провайдеров по ролям (chat/light/vision),
 обходит лимиты (429 → модель «отдыхает»), считает расход по дням (таблица usage)."""
+import json
 import logging
 import re
 import time
@@ -31,6 +32,8 @@ class Router:
                     headers={"Authorization": f"Bearer {k}", **p.get("headers", {})})
         self.available = {}       # provider → set(model ids) из каталога; нет записи — каталог не прочитан
         self.resting = {}         # (provider, model) → monotonic до какого времени не трогать
+        self.budget = {}          # (provider, model) → (осталось токенов в минуту, monotonic когда обновится)
+        self.chat_times = []      # когда были запросы болтовни — фоновые задачи уступают
         log.info("провайдеры с ключами: %s", ", ".join(self.clients) or "нет")
 
     async def discover(self):
@@ -78,21 +81,37 @@ class Router:
         return [tuple(r) for r in rows]
 
     # ---------- запрос ----------
-    def candidates(self, role):
+    def busy(self, window=60, n=2):
+        """Идёт живая болтовня — фоновым задачам (сводки, память, чтение истории) лучше подождать."""
         now = time.monotonic()
-        out = []
+        self.chat_times = [t for t in self.chat_times if now - t < window]
+        return len(self.chat_times) >= n
+
+    def candidates(self, role, need=0):
+        now = time.monotonic()
+        out, tight = [], []
         for p, m in MODELS[role]:
             if not self.usable(p, m) or self.resting.get((p, m), 0) > now:
+                continue
+            left, reset = self.budget.get((p, m), (None, 0))
+            if need and left is not None and reset > now and left < need:
+                tight.append((p, m))           # по заголовкам не влезет — в конец очереди, а не мимо
                 continue
             daily = PROVIDERS[p].get("daily")
             if daily and self.used_today(p) >= daily:
                 continue
             out.append((p, m))
-        return out
+        return out + tight
 
-    async def complete(self, messages, role="chat", tools=None, max_tokens=900, temperature=0.75, json_mode=False):
+    async def complete(self, messages, role="chat", tools=None, max_tokens=900, temperature=0.75, json_mode=False,
+                       tool_choice=None):
         last = None
-        for p, m in self.candidates(role):
+        if role == "chat":
+            self.chat_times.append(time.monotonic())
+        # грубая оценка размера: русский текст ~2.3 символа на токен, плюс ответ
+        need = int(len(json.dumps(messages, ensure_ascii=False)) / 2.3 + (len(json.dumps(tools)) / 3 if tools else 0)
+                   + max_tokens * 0.5)
+        for p, m in self.candidates(role, need):
             body = {"model": m, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
             if p == "groq":
                 body["reasoning_effort"] = "none" if m.startswith("qwen/") else "low"
@@ -100,15 +119,22 @@ class Router:
                 body["reasoning_effort"] = "low"
             if tools:
                 body["tools"] = tools
+                if tool_choice:
+                    body["tool_choice"] = tool_choice
             if json_mode:
                 body["response_format"] = {"type": "json_object"}
             try:
                 r = await self.clients[p].post("/chat/completions", json=body)
+                if r.status_code == 400 and "tool_use_failed" in r.text and "tool_choice" in body:
+                    # модель не захотела вызывать обязательный инструмент — та же модель, но без принуждения
+                    body.pop("tool_choice")
+                    r = await self.clients[p].post("/chat/completions", json=body)
             except httpx.HTTPError as e:
                 last = f"{p}:{m} сеть {e!r}"
                 self.resting[(p, m)] = time.monotonic() + 60
                 self._count(p, m, False)
                 continue
+            self._remember_budget(p, m, r)
             if r.status_code == 200:
                 data = r.json()
                 self._count(p, m, True, data.get("usage"))
@@ -133,6 +159,16 @@ class Router:
                 continue
         raise RateLimited(last or f"нет доступных моделей для роли {role}")
 
+    def _remember_budget(self, p, m, r):
+        left = r.headers.get("x-ratelimit-remaining-tokens")
+        if left is None:
+            return
+        reset = _seconds(r.headers.get("x-ratelimit-reset-tokens", "60s"))
+        try:
+            self.budget[(p, m)] = (int(float(left)), time.monotonic() + reset)
+        except ValueError:
+            pass
+
     @staticmethod
     def _rest(r):
         if r.status_code == 429:
@@ -142,8 +178,10 @@ class Router:
             except (TypeError, ValueError):
                 wait = 60
             if re.search(r"per day|daily|RPD|TPD|requests per day|tokens per day", r.text, re.I):
-                wait = max(wait, 3 * 3600)
+                wait = max(wait, 3600)       # дневной лимит: Groq отдаёт точный retry-after, иначе — час
             return min(wait, 12 * 3600)
+        if r.status_code == 400 and "tool_use_failed" in r.text:
+            return 5                   # ошибка этого запроса, а не модели
         if r.status_code in (401, 403):
             return 6 * 3600            # ключ не тот / регион — надолго
         if r.status_code == 404:
@@ -153,3 +191,11 @@ class Router:
     async def raw(self, provider):
         """Клиент провайдера (для whisper и прочего нестандартного)."""
         return self.clients.get(provider)
+
+
+def _seconds(v):
+    """«2m59.5s», «7.66s», «120ms» → секунды."""
+    total = 0.0
+    for num, unit in re.findall(r"([\d.]+)(ms|h|m|s)", v or ""):
+        total += float(num) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
+    return total or 60.0

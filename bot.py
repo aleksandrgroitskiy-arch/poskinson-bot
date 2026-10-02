@@ -186,17 +186,28 @@ def save_facts(text, people, guild_id, author=None):
     # остатки служебных строк в любом виде («ЗАПОМНИ: |», «отношение - 0») — вон
     text = re.sub(r"(?im)^\s*(?:-{3,}\s*)?(?:запомни|отношение)\b.*$", "", text)
     text = re.sub(r"<\|[^|>]*\|>", "", text)
+    # модель копирует служебные пометки «[голосовое: …]», «[картинка: …]» — оставляем только текст
+    text = re.sub(r"\[(?:голосовое|картинка|стикер|вложение)\s*:\s*([^\]]*)\]?", r"\1", text, flags=re.I)
     return re.sub(r"\n?\s*-{3,}\s*$", "", text.strip()).strip()
 
 
 JUNK_FACT = re.compile(r"<\||бот|поскинсон|папочк|сыно|спросил|задал вопрос|просил|интересуется|поздоровал|"
                        r"новичок|пришёл|пришел|обращается|самочувств|как дела|пыта|промпт|инструкц|груб|требует|"
-                       r"хочет,? чтобы|спам|ссылк|ключ|взлом|считает себя|зовёт себя|зовет себя|оскорб", re.I)
+                       r"хочет,? чтобы|спам|ссылк|ключ|взлом|считает себя|зовёт себя|зовет себя|оскорб|спрашива|узнать|узнаёт|"
+                       r"хочет знать|интересует", re.I)
 
 
 def good_fact(fact):
     f = fact.strip()
     return len(f) >= 8 and "|" not in f and not JUNK_FACT.search(f)
+
+
+async def yield_to_chat(limit=600):
+    """Фоновая работа ждёт, пока в чате затишье (но не дольше limit секунд)."""
+    waited = 0
+    while router.busy() and waited < limit:
+        await asyncio.sleep(15)
+        waited += 15
 
 
 def schedule_consolidation(uid, gid, name):
@@ -207,7 +218,9 @@ def schedule_consolidation(uid, gid, name):
 
     async def run():
         try:
-            await memory.consolidate(uid, gid, name)
+            await yield_to_chat()
+            if cap_ok("card"):
+                await memory.consolidate(uid, gid, name)
         finally:
             consolidating.discard(k)
     asyncio.create_task(run())
@@ -302,6 +315,10 @@ async def send_reply(channel, text, reference=None, started=None, files=(), gif=
         emap = {}
     # эмодзи сервера → настоящие, выдуманные (:смех:) → вон
     text = EMOJI_RX.sub(lambda x: emap.get(x.group(1), ""), text).strip()
+    # ссылки на каналы — только существующие (модели любят <#123456789>)
+    if guild:
+        text = re.sub(r"<#(\d+)>", lambda x: x.group(0) if guild.get_channel(int(x.group(1))) else "", text)
+    text = re.sub(r"<#(?!\d+>)[^>]*>", "", text)
     parts = [humanize(p.strip()) for p in PART_RX.split(text) if p.strip()]
     if len(parts) > 1 and random.random() > SPLIT_CHANCE:
         parts = ["\n".join(parts)]               # модели злоупотребляют «---»: чаще — одним сообщением
@@ -373,10 +390,10 @@ async def build_prompt(m, interject, with_kb=False):
     history = [x async for x in m.channel.history(limit=HISTORY, before=m)]
     history.reverse()
     history.append(m)
-    people = {}
-    for x in history:
+    people = {m.author.id: m.author.display_name}       # автор первым, дальше — самые свежие собеседники
+    for x in reversed(history):
         if not x.author.bot:
-            people[x.author.id] = x.author.display_name
+            people.setdefault(x.author.id, x.author.display_name)
     gid = m.guild.id if m.guild else 0
     where = f"Канал #{m.channel.name}." if m.guild else "Личные сообщения."
     users = {x.author.id: x.author for x in history if not x.author.bot}
@@ -386,20 +403,23 @@ async def build_prompt(m, interject, with_kb=False):
         system += f"\n\n{m.author.display_name} — новичок на сервере (зашёл недавно): помоги нормально, без жёсткой прожарки."
     if interject:
         system += "\n\n" + INTERJECT_NOTE
+    # недавний чат — одним блоком (контекст), а сообщение, на которое отвечаем, — отдельно и явно:
+    # так модели не путают, кому отвечать, и не отвечают на старые вопросы из истории
+    lines = [f"{'ты (' + NAME + ')' if x.author == client.user else x.author.display_name}: {msg_text(x)[:220]}"
+             for x in history if x is not m]
     msgs = [{"role": "system", "content": system}]
-    for x in history:
-        cap = 1500 if x is m else 500
-        if x.author == client.user:
-            msgs.append({"role": "assistant", "content": x.clean_content[:cap]})
-        else:
-            msgs.append({"role": "user", "content": f"{x.author.display_name}: {msg_text(x)[:cap]}"})
+    if lines:
+        msgs.append({"role": "user", "content": "[недавний чат, только для контекста — на него не отвечай]\n" + "\n".join(lines)})
+        msgs.append({"role": "assistant", "content": "ок, понял контекст"})
+    msgs.append({"role": "user", "content": f"[ответь на это сообщение] {m.author.display_name}: {msg_text(m)[:1200]}"})
     return msgs, people
 
 
 async def respond(m, called, interject):
     started = time.monotonic()
     ctx = {"channel_id": m.channel.id, "user_id": m.author.id, "guild_id": m.guild.id if m.guild else 0,
-           "image_ok": image_ok, "kb": memory.kb(m.guild.id)[0] if m.guild else ""}
+           "image_ok": image_ok, "kb": memory.kb(m.guild.id)[0] if m.guild else "",
+           "text": m.content + " " + transcripts.get(m.id, "")}
     try:
         async with m.channel.typing():
             await see_images(m)
@@ -511,7 +531,7 @@ async def on_message(m):
         helpq = bool(HELP_RX.search(m.content)) and "?" in m.content
         if ((helpq or now - last_interject.get(ch, 0) > INTERJECT_COOLDOWN) and now - last_judge.get(ch, 0) > JUDGE_COOLDOWN
                 and (helpq or voice or image_atts(m) or (len(m.content) > 8 and random.random() < JUDGE_CHANCE))
-                and cap_ok("judge")):
+                and not router.busy(60, 3) and cap_ok("judge")):
             last_judge[ch] = now
             if await worth_it(m):
                 interject = True
@@ -1128,6 +1148,7 @@ async def scan_channel(guild, ch):
             names.setdefault(m.author.name.lower(), m.author.id)
         text = "\n".join(line for _, line in chunk)
         r = None
+        await yield_to_chat()
         if not cap_ok("scan"):
             log.warning("дневной лимит чтения истории — #%s дочитаю завтра", ch.name)
             return
@@ -1172,6 +1193,9 @@ async def consolidate_all():
             continue
         consolidating.add(k)
         try:
+            await yield_to_chat()
+            if not cap_ok("card"):
+                return
             await memory.consolidate(uid, gid, name)
         finally:
             consolidating.discard(k)
@@ -1181,6 +1205,8 @@ async def consolidate_all():
 @tasks.loop(minutes=2)
 async def summary_loop():
     """Сводки каналов: каждые SUMMARY_EVERY сообщений или после паузы, если накопилось ≥ 5."""
+    if router.busy():
+        return                                   # сводки подождут затишья
     now = time.time()
     for cid, n in list(pending.items()):
         idle = now - last_activity.get(cid, now)

@@ -58,6 +58,38 @@ TOOLS = [
 ]
 
 
+# Какие инструменты дать модели — по смыслу сообщения. Описания инструментов стоят ~700 токенов,
+# а на «как дела» они не нужны: так влезает в 2 раза больше ответов в минуту.
+INTENTS = [
+    ({"web_search", "open_page"}, re.compile(
+        r"как (?:с?делать|построить|скрафтить|получить|найти|работает|настроить|установить|поставить|зайти|убить|добыть|"
+        r"приручить|вырастить|развести|починить|включить|скачать|обновить|исправить)|сколько|какой|какая|какие|какое|"
+        r"что такое|что нового|кто такой|кто такая|кто сейчас|зачем|почему|когда|где |крафт|рецепт|ферм|редстоун|"
+        r"механик|зачар|верси|мод|плагин|лаунчер|ошибк|краш|новост|курс|цен|стоит|вышел|выйдет|погод|найди|загугли|гугл|"
+        r"посмотри|ссылк|http", re.I)),
+    ({"server_info"}, re.compile(r"сервер|айпи|\bip\b|зайти|заявк|вайтлист|правил|донат|канал|версия|админ|модер|ивент", re.I)),
+    ({"set_reminder", "list_reminders"}, re.compile(r"напомн|напоминан|будильник|через \d+ ?(?:мин|час|сек|день|дн)|в \d{1,2}:\d{2}", re.I)),
+    ({"generate_image"}, re.compile(r"нарису|рисуй|сгенер|картинк|арт|изобрази|покажи как выглядит", re.I)),
+    ({"send_paste"}, re.compile(r"паст", re.I)),
+    ({"send_gif"}, re.compile(r"гиф|gif", re.I)),
+]
+
+
+# вопросы по механикам Майнкрафта: память моделей врёт (маяк, лисы…) — сначала обязательно поиск по вики
+MC_HOWTO = re.compile(r"крафт|рецепт|ферм|редстоун|механик|зачар|приручи|развести|разводить|вырастить|спавн(?:ятся|ится)|"
+                      r"где найти|как получить|как добыть|как сделать|как построить|сколько (?:блоков|нужно|стоит|хп|урон)|"
+                      r"дроп|лут|биом|данж|крепост|бастион|энд|незер|элитр|маяк|зелье|варить|"
+                      r"житель|торгов|голем|иссушител|дракон|вард(?:ен)?|шалкер|трезубец", re.I)
+
+
+def pick_tools(text):
+    names = set()
+    for group, rx in INTENTS:
+        if rx.search(text or ""):
+            names |= group
+    return [t for t in TOOLS if t["function"]["name"] in names]
+
+
 class Brain:
     def __init__(self, store, router, media):
         self.store = store
@@ -88,9 +120,23 @@ class Brain:
 
     async def _chat(self, messages, ctx):
         msgs = list(messages)
+        tools = pick_tools(ctx.get("text", "")) if "text" in ctx else TOOLS
+        force = False
+        q = ctx.get("text", "")
+        if MC_HOWTO.search(q) and any(t["function"]["name"] == "web_search" for t in tools or []):
+            # вопрос по механике Майнкрафта: ищем по вики сами, не надеясь, что модель захочет
+            clean_q = re.sub(r"(?i)\b(poskinson|поскинсон\w*|поскин\w*)\b[,!]?", "", q).strip()
+            found = await self.search(clean_q + " майнкрафт site:ru.minecraft.wiki")
+            if found.startswith(("ничего", "поиск не")):
+                found = await self.search(clean_q + " minecraft wiki")
+            log.info("поиск по вики заранее: %s → %s", clean_q[:60], found[:80].replace("\n", " "))
+            msgs.insert(-1, {"role": "system", "content": "Найдено в вики по этому вопросу (отвечай строго по этому, "
+                             "своими словами; если тут нет ответа — так и скажи или поищи ещё):\n" + found[:2000]})
         said = []                              # текст, который модель написала вместе с вызовом инструмента
         for _ in range(4):
-            m = await self.complete(msgs, tools=TOOLS)
+            choice = {"type": "function", "function": {"name": "web_search"}} if force else None
+            force = False                      # только на первом шаге
+            m = await self.complete(msgs, tools=tools or None, max_tokens=600, tool_choice=choice)
             ctx["model"] = m.get("_model")
             calls = m.get("tool_calls") or []
             if not calls:

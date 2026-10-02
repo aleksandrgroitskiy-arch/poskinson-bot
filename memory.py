@@ -251,8 +251,9 @@ class Memory:
     # ---------- что идёт в подсказку ----------
     def prompt_block(self, guild_id, channel_id, people, special=None, with_kb=True):
         out = []
-        for uid, name in people.items():
+        for uid, name in list(people.items())[:4]:      # автор и до трёх собеседников
             card, _ = self.card(uid)
+            card = card[:450]
             fresh = self.fresh_facts(uid, limit=MAX_FACTS)
             mood = (special or {}).get(uid) or f"Твоё отношение: {self.tier(self.rep(uid))}"
             s = f"[{name}] {mood}\n" + (card + "\n" if card else "")
@@ -266,6 +267,7 @@ class Memory:
                    + "\n\n" + mem)
             lore, _ = self.card(0, guild_id)
             fresh = self.fresh_facts(0, guild_id, limit=MAX_SERVER_FACTS)
+            lore = lore[:450]
             if lore or fresh:
                 mem += "\n\nЛор сервера:\n" + (lore + "\n" if lore else "") + ("Свежее: " + "; ".join(fresh) if fresh else "")
             eps = self.episodes(guild_id)
@@ -273,6 +275,7 @@ class Memory:
                 mem += "\n\nНедавние события сервера:\n" + "\n".join(eps)
         if channel_id:
             summary, _, upd = self.channel(channel_id)
+            summary = summary[:450]
             if summary:
                 mem += f"\n\nСводка этого канала (на {datetime.fromtimestamp(upd, TZ):%d.%m %H:%M}):\n{summary}"
         return mem
