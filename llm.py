@@ -117,6 +117,12 @@ class Router:
                 if tools is None and not (msg.get("content") or "").strip():
                     last = f"{p}:{m} пустой ответ"
                     continue
+                if re.search(r"<tool_call>|<function=|<\|tool", msg.get("content") or ""):
+                    # провайдер сломал вызов инструментов и отдал его текстом — не позоримся, следующая модель
+                    last = f"{p}:{m} инструмент текстом"
+                    log.warning(last)
+                    self.resting[(p, m)] = time.monotonic() + 600
+                    continue
                 return msg
             self._count(p, m, False)
             last = f"{p}:{m} HTTP {r.status_code} {r.text[:200]}"

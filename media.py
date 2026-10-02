@@ -1,5 +1,6 @@
 """Медиа: голосовые → текст, картинка → описание, текст → картинка, поиск гифок."""
 import base64
+import re
 import logging
 import random
 import urllib.parse
@@ -13,6 +14,12 @@ log = logging.getLogger("poskinson.media")
 
 DESCRIBE_PROMPT = ("Опиши картинку по-русски для участника чата, который её не видит: что на ней, кто/что изображено, "
                    "настроение, если это мем — в чём шутка, весь текст на картинке дословно. 2–5 предложений, без вступлений.")
+
+
+# бот на публичном сервере: откровенное, дети в сомнительном контексте, жесть — не рисуем
+NSFW = re.compile(r"\b(nude|naked|nsfw|porn|sex|sexual|erotic|hentai|genital|nipple|boob|breast|lingerie|undress|"
+                  r"gore|dismember|decapitat|beheading|torture|suicide|self-harm|child|kid|minor|loli|shota|teen)\w*|"
+                  r"гол(ая|ый|ые)|порно|секс|эроти|хентай|расчлен|суицид", re.I)
 
 
 class Media:
@@ -60,6 +67,8 @@ class Media:
     # ---------- текст → картинка ----------
     async def generate(self, prompt):
         """prompt по-английски. Возвращает (bytes, имя файла, источник)."""
+        if NSFW.search(prompt):
+            raise ValueError("такое не рисую")
         if CF_ACCOUNT and CF_TOKEN:
             try:
                 r = await self.web.post(

@@ -16,7 +16,8 @@ import sqlite3
 import time
 from datetime import datetime
 
-from config import (BACKUP_DIR, BACKUP_KEEP, CONSOLIDATE_AFTER, EPISODES_IN_PROMPT, MAX_FACTS, MAX_SERVER_FACTS, TZ)
+from config import (BACKUP_DIR, BACKUP_KEEP, CONSOLIDATE_AFTER, EPISODES_IN_PROMPT, MAX_FACTS, MAX_SERVER_FACTS, REP_DECAY_PER_DAY,
+                    REP_HOURLY_CAP, REP_STEP, REP_TIERS, SAM_REP_MULT, TZ)
 from llm import RateLimited
 
 log = logging.getLogger("poskinson.memory")
@@ -48,6 +49,20 @@ summary — обновлённая сводка «что сейчас и нед�
 episode — одна строка для хронологии сервера о самом заметном в НОВЫХ сообщениях (до 140 символов), или "" если ничего заметного."""
 
 
+KB_PROMPT = """Ниже сообщения из информационных каналов Discord-сервера Майнкрафт-проекта (правила, инфо, гайды, анонсы, заявки).
+Собери по ним «Базу знаний сервера» для бота, который отвечает новичкам. Строго только то, что прямо написано — ничего не додумывай
+(особенно IP, версии, цены, правила). Разделы (пустые пропускай), коротко:
+Сервер: название, режим/тип, версия игры, Java/Bedrock, лаунчер/сборка
+Как зайти: IP/адрес и шаги (вайтлист, заявка, регистрация, моды)
+Заявки: где и как подать, что указать
+Правила: самое главное кратко (5–10 пунктов) + где полные
+Донат/магазин: если есть
+Каналы: по строке «<#id> — для чего» (id бери из пометок [канал #имя id=…])
+Ссылки: сайт, карта, соцсети, если есть
+Важные анонсы: последние 2–3, с датой
+Не больше 1800 символов. Только база, без вступлений."""
+
+
 class Memory:
     def __init__(self, store, router):
         self.store = store
@@ -57,6 +72,9 @@ class Memory:
                    " updated REAL, PRIMARY KEY (user_id, guild_id))")
         db.execute("CREATE TABLE IF NOT EXISTS channels (channel_id INTEGER PRIMARY KEY, guild_id INTEGER, name TEXT,"
                    " summary TEXT, last_msg_id INTEGER, updated REAL)")
+        db.execute("CREATE TABLE IF NOT EXISTS rep (user_id INTEGER PRIMARY KEY, score REAL, updated REAL,"
+                   " hour_start REAL, hour_delta REAL)")
+        db.execute("CREATE TABLE IF NOT EXISTS kb (guild_id INTEGER PRIMARY KEY, text TEXT, updated REAL)")
         db.execute("CREATE TABLE IF NOT EXISTS episodes (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,"
                    " channel_id INTEGER, ts REAL, text TEXT)")
         db.commit()
@@ -174,19 +192,78 @@ class Memory:
                                (guild_id, limit)).fetchall()
         return [f"{datetime.fromtimestamp(ts, TZ):%d.%m %H:%M} — {t}" for ts, t in reversed(rows)]
 
+    # ---------- скрытая репутация: как человек обращается с ботом ----------
+    def rep(self, user_id):
+        r = self.db.execute("SELECT score, updated FROM rep WHERE user_id=?", (user_id,)).fetchone()
+        if not r:
+            return 0.0
+        days = max(0.0, (time.time() - r[1]) / 86400)
+        return r[0] * (1 - REP_DECAY_PER_DAY) ** days
+
+    def rep_apply(self, user_id, attitude, sam=False):
+        """attitude −3…3 из строки ОТНОШЕНИЕ. Обычным — не больше REP_HOURLY_CAP очков в час."""
+        attitude = max(-3, min(3, int(attitude)))
+        if attitude == 0:
+            return self.rep(user_id)
+        now = time.time()
+        r = self.db.execute("SELECT hour_start, hour_delta FROM rep WHERE user_id=?", (user_id,)).fetchone()
+        hour_start, hour_delta = (r if r else (now, 0.0))
+        if now - hour_start > 3600:
+            hour_start, hour_delta = now, 0.0
+        delta = attitude * REP_STEP * (SAM_REP_MULT if sam else 1)
+        if not sam:
+            room = REP_HOURLY_CAP - abs(hour_delta) if (hour_delta >= 0) == (delta >= 0) else REP_HOURLY_CAP
+            delta = max(-room, min(room, delta)) if room > 0 else 0
+        score = max(-100.0, min(100.0, self.rep(user_id) + delta))
+        self.db.execute("INSERT OR REPLACE INTO rep VALUES (?,?,?,?,?)", (user_id, score, now, hour_start, hour_delta + delta))
+        self.db.commit()
+        return score
+
+    @staticmethod
+    def tier(score):
+        for edge, name in REP_TIERS:
+            if score < edge:
+                return name
+        return REP_TIERS[-1][1]
+
+    # ---------- база знаний сервера ----------
+    def kb(self, guild_id):
+        r = self.db.execute("SELECT text, updated FROM kb WHERE guild_id=?", (guild_id,)).fetchone()
+        return (r[0], r[1]) if r else ("", 0)
+
+    async def build_kb(self, guild_id, lines):
+        """lines — сообщения инфо-каналов с пометками [канал #имя id=…]."""
+        text = "\n".join(lines)[-24000:]
+        try:
+            m = await self.router.complete([{"role": "system", "content": KB_PROMPT}, {"role": "user", "content": text}],
+                                           role="memory", max_tokens=1200, temperature=0)
+        except RateLimited as e:
+            log.warning("база знаний не собрана: %s", e)
+            return False
+        kb = (m.get("content") or "").strip()[:2500]
+        if len(kb) < 20:
+            return False
+        self.db.execute("INSERT OR REPLACE INTO kb VALUES (?,?,?)", (guild_id, kb, time.time()))
+        self.db.commit()
+        log.info("база знаний сервера %s собрана (%d символов) моделью %s", guild_id, len(kb), m.get("_model"))
+        return True
+
     # ---------- что идёт в подсказку ----------
-    def prompt_block(self, guild_id, channel_id, people):
+    def prompt_block(self, guild_id, channel_id, people, special=None, with_kb=True):
         out = []
         for uid, name in people.items():
             card, _ = self.card(uid)
             fresh = self.fresh_facts(uid, limit=MAX_FACTS)
-            if card or fresh:
-                s = f"[{name}]\n" + (card + "\n" if card else "")
-                if fresh:
-                    s += "Свежее: " + "; ".join(fresh)
-                out.append(s.strip())
+            mood = (special or {}).get(uid) or f"Твоё отношение: {self.tier(self.rep(uid))}"
+            s = f"[{name}] {mood}\n" + (card + "\n" if card else "")
+            if fresh:
+                s += "Свежее: " + "; ".join(fresh)
+            out.append(s.strip())
         mem = "Память о людях в чате:\n" + ("\n\n".join(out) or "(пока ничего)")
-        if guild_id:
+        if guild_id and with_kb:
+            kb, _ = self.kb(guild_id)
+            mem = ("База знаний сервера:\n" + (kb or "(пока не собрана — про сервер отправляй в инфо-каналы и к админам)")
+                   + "\n\n" + mem)
             lore, _ = self.card(0, guild_id)
             fresh = self.fresh_facts(0, guild_id, limit=MAX_SERVER_FACTS)
             if lore or fresh:
@@ -223,6 +300,14 @@ class Memory:
         lines += ["", "## Сводки каналов"]
         for name, summary, upd in self.db.execute("SELECT name, summary, updated FROM channels"):
             lines += [f"### #{name} ({datetime.fromtimestamp(upd, TZ):%d.%m %H:%M})", summary, ""]
+        lines.append("## База знаний серверов")
+        for gid, kb, upd in self.db.execute("SELECT guild_id, text, updated FROM kb"):
+            lines += [f"### {gid} ({datetime.fromtimestamp(upd, TZ):%d.%m %H:%M})", kb, ""]
+        lines.append("## Отношение (скрытая репутация)")
+        for uid, score in self.db.execute("SELECT user_id, score FROM rep ORDER BY score"):
+            name = self.db.execute("SELECT name FROM users WHERE user_id=? LIMIT 1", (uid,)).fetchone()
+            lines.append(f"- {name[0] if name else uid}: {self.rep(uid):+.0f} ({self.tier(self.rep(uid))})")
+        lines.append("")
         lines.append("## Хронология")
         for ts, t in self.db.execute("SELECT ts, text FROM episodes ORDER BY ts"):
             lines.append(f"- {datetime.fromtimestamp(ts, TZ):%d.%m %H:%M} — {t}")

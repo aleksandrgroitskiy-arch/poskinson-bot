@@ -22,6 +22,7 @@ class Store:
           " PRIMARY KEY (guild_id, user_id, kind))")
         x("CREATE TABLE IF NOT EXISTS settings (guild_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (guild_id, key))")
         x("CREATE TABLE IF NOT EXISTS scanned (channel_id INTEGER PRIMARY KEY, ts REAL)")
+        self._pastes_table()
         self.db.commit()
 
     # ---- факты ----

@@ -26,7 +26,9 @@ from brain import Brain, RateLimited, fix_script
 from config import (CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
                     JUDGE_PROMPT, JUDGE_THRESHOLD, LOG_DIR, LOH_HOUR, MAX_PARTS, NAME, PERSONA, QUIZ_SECONDS,
                     REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SPLIT_CHANCE, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
-                    SUMMARY_EVERY, SUMMARY_IDLE, TOKEN, TYPING_CPS, TYPING_MAX, TZ, VERSION)
+                    SUMMARY_EVERY, SUMMARY_IDLE, TOKEN, TYPING_CPS, TYPING_MAX, TZ, VERSION, DAILY_CAPS, FLOOD_PER_MIN,
+                    IMAGES_PER_USER_HOUR, KB_CHANNEL_RX, KB_LIMIT, PASTE_MAX, PASTES_PER_USER, SAM_FLIP,
+                    SAM_RX, SCAN_CHANNELS)
 from llm import Router
 from media import Media
 from memory import Memory
@@ -53,6 +55,12 @@ last_judge = {}         # channel_id → когда последний раз с
 pending = {}            # channel_id → сколько сообщений с последней сводки
 last_activity = {}      # channel_id → время последнего сообщения
 consolidating = set()   # карточки, которые сейчас пересобираются
+calls_by_user = {}      # user_id → [время обращений] — антифлуд
+images_by_user = {}     # user_id → [время рисований]
+kb_dirty = set()        # серверы, где в инфо-каналах что-то поменялось
+REP_RX = re.compile(r"^\s*(?:-{3,}\s*)?ОТНОШЕНИЕ\s*:\s*([+-−–]?\s*\d)\s*$", re.M | re.I)
+HELP_RX = re.compile(r"как\s+(?:за(?:йти|йду|ходить)|попасть|играть|подать|начать)|айпи|\bip\b|адрес\s+сервера|"
+                     r"заявк|вайтлист|whitelist|правил|какая\s+версия|на\s+какой\s+версии|лаунчер|сборк", re.I)
 quizzes = {}            # channel_id → активная викторина
 FACT_RX = re.compile(r"^\s*(?:-{3,}\s*)?ЗАПОМНИ\s*:\s*(.+?)\s*\|\s*(.+?)\s*$", re.M | re.I)
 TIRED = "мана кончилась, дай реген пару минут"
@@ -64,6 +72,61 @@ def now_line():
     days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
     n = datetime.now(TZ)
     return f"Сейчас {n:%d.%m.%Y %H:%M}, {days[n.weekday()]} (Москва)."
+
+
+def cap_ok(kind):
+    """Дневной лимит служебных запросов (на все серверы), чтобы большой сервер не съел всё."""
+    day = datetime.now(TZ).date().isoformat()
+    key = f"cap:{kind}:{day}"
+    n = int(store.get(0, key, 0))
+    if n >= DAILY_CAPS.get(kind, 10 ** 9):
+        return False
+    store.put(0, key, n + 1)
+    return True
+
+
+def image_ok(uid):
+    now = time.time()
+    lst = [t for t in images_by_user.get(uid, []) if now - t < 3600]
+    if len(lst) >= IMAGES_PER_USER_HOUR or not cap_ok("image"):
+        return False
+    lst.append(now)
+    images_by_user[uid] = lst
+    return True
+
+
+def flooding(uid):
+    now = time.time()
+    lst = [t for t in calls_by_user.get(uid, []) if now - t < 60]
+    lst.append(now)
+    calls_by_user[uid] = lst
+    return len(lst) > FLOOD_PER_MIN
+
+
+def is_sam(user):
+    sid = store.get(0, "sam_id")
+    if sid and int(sid) == user.id:
+        return True
+    names = [getattr(user, a, None) or "" for a in ("name", "display_name", "global_name", "nick")]
+    if any(SAM_RX.search(n.strip()) for n in names if n):
+        store.put(0, "sam_id", user.id)
+        log.info("нашёл sam_takov: %s (%s)", user, user.id)
+        return True
+    return False
+
+
+def sam_mood(uid):
+    """sam_takov: «папочка», когда он добр к боту, «сынок», когда агрессивен; плюс внезапные перепады."""
+    base = ("Это sam_takov — тот, в честь кого тебя назвали, у тебя к нему особые чувства и настроение к нему резко скачет. "
+            "Смотри на тон ЕГО последнего сообщения: если он добр к тебе — называй его «папочка», ласкайся по-пацански; "
+            "если грубит или наезжает — называй его «сынок», снисходительно и агрессивно, как разочарованный батя.")
+    if random.random() < SAM_FLIP:
+        return base + " НО сейчас у тебя внезапная смена настроения — реагируй ровно наоборот (на доброту — «сынок» и наезд, на грубость — «папочка» и нежности)."
+    return base
+
+
+def specials(users):
+    return {u.id: sam_mood(u.id) for u in users if not u.bot and is_sam(u)}
 
 
 def muted(channel_id):
@@ -87,10 +150,25 @@ def emoji_block(guild):
     return out
 
 
-def save_facts(text, people, guild_id):
-    """Вырезает строки «ЗАПОМНИ: …», кладёт факты в память, при надобности пересобирает карточки."""
+def save_facts(text, people, guild_id, author=None):
+    """Вырезает служебные строки. ЗАПОМНИ — в память (о человеке — только если это автор сообщения:
+    слухи о других не записываем); ОТНОШЕНИЕ — в скрытую репутацию автора."""
+    if author is not None:
+        mt = REP_RX.search(text)
+        if mt:
+            try:
+                att = int(mt.group(1).replace("−", "-").replace("–", "-").replace(" ", ""))
+                score = memory.rep_apply(author.id, att, sam=is_sam(author))
+                if att:
+                    log.info("отношение к %s: %+d → %.0f", author.display_name, att, score)
+            except ValueError:
+                pass
+        people = {author.id: people.get(author.id, author.display_name)}
+    text = REP_RX.sub("", text)
     by_name = {n.lower(): uid for uid, n in people.items()}
     for name, fact in FACT_RX.findall(text):
+        if not good_fact(fact):
+            continue
         key = name.strip().lstrip("@").lower()
         if key == "сервер" and guild_id:
             new, due = memory.add_fact(0, "сервер", fact, guild_id)
@@ -104,7 +182,21 @@ def save_facts(text, people, guild_id):
                 log.info("запомнил: %s | %s", name, fact)
             if due:
                 schedule_consolidation(by_name[key], 0, name.strip())
-    return FACT_RX.sub("", text).strip()
+    text = FACT_RX.sub("", text)
+    # остатки служебных строк в любом виде («ЗАПОМНИ: |», «отношение - 0») — вон
+    text = re.sub(r"(?im)^\s*(?:-{3,}\s*)?(?:запомни|отношение)\b.*$", "", text)
+    text = re.sub(r"<\|[^|>]*\|>", "", text)
+    return re.sub(r"\n?\s*-{3,}\s*$", "", text.strip()).strip()
+
+
+JUNK_FACT = re.compile(r"<\||бот|поскинсон|папочк|сыно|спросил|задал вопрос|просил|интересуется|поздоровал|"
+                       r"новичок|пришёл|пришел|обращается|самочувств|как дела|пыта|промпт|инструкц|груб|требует|"
+                       r"хочет,? чтобы|спам|ссылк|ключ|взлом|считает себя|зовёт себя|зовет себя|оскорб", re.I)
+
+
+def good_fact(fact):
+    f = fact.strip()
+    return len(f) >= 8 and "|" not in f and not JUNK_FACT.search(f)
 
 
 def schedule_consolidation(uid, gid, name):
@@ -164,11 +256,11 @@ def is_voice(m):
     return any(getattr(a, "is_voice_message", lambda: False)() for a in m.attachments)
 
 
-async def send_long(channel, text, reference=None):
+async def send_long(channel, text, reference=None, mentions=MENTIONS):
     text = text.strip() or "…"
     chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)]
     for i, c in enumerate(chunks):
-        await channel.send(c, reference=reference if i == 0 else None, mention_author=False, allowed_mentions=MENTIONS)
+        await channel.send(c, reference=reference if i == 0 else None, mention_author=False, allowed_mentions=mentions)
 
 
 STICKER_RX = re.compile(r"\[стикер:\s*([^\]]+)\]", re.I)
@@ -246,9 +338,9 @@ async def send_reply(channel, text, reference=None, started=None, files=(), gif=
             pass
 
 
-async def say(guild_id, people, instruction, max_tokens=500):
+async def say(guild_id, people, instruction, max_tokens=500, special=None):
     """Короткая реплика в характере по заданию (для команд и событий)."""
-    system = PERSONA + "\n" + now_line() + "\n" + memory.prompt_block(guild_id, None, people)
+    system = PERSONA + "\n" + now_line() + "\n" + memory.prompt_block(guild_id, None, people, special)
     system += "\n\nСейчас ответ уходит одним сообщением: не используй разделитель ---, стикеры и гифки."
     m = await brain.complete([{"role": "system", "content": system}, {"role": "user", "content": instruction}],
                              max_tokens=max_tokens)
@@ -272,7 +364,12 @@ def is_called(m):
     return bool(CALL_RX.search(m.content) or CALL_RX.search(transcripts.get(m.id, "")))
 
 
-async def build_prompt(m, interject):
+def is_newbie(member):
+    joined = getattr(member, "joined_at", None)
+    return bool(joined) and (datetime.now(joined.tzinfo) - joined).days < 3
+
+
+async def build_prompt(m, interject, with_kb=False):
     history = [x async for x in m.channel.history(limit=HISTORY, before=m)]
     history.reverse()
     history.append(m)
@@ -282,8 +379,11 @@ async def build_prompt(m, interject):
             people[x.author.id] = x.author.display_name
     gid = m.guild.id if m.guild else 0
     where = f"Канал #{m.channel.name}." if m.guild else "Личные сообщения."
+    users = {x.author.id: x.author for x in history if not x.author.bot}
     system = (PERSONA + emoji_block(m.guild) + "\n" + now_line() + " " + where + "\n"
-              + memory.prompt_block(gid, m.channel.id if m.guild else None, people))
+              + memory.prompt_block(gid, m.channel.id if m.guild else None, people, specials(users.values()), with_kb=with_kb))
+    if m.guild and is_newbie(m.author):
+        system += f"\n\n{m.author.display_name} — новичок на сервере (зашёл недавно): помоги нормально, без жёсткой прожарки."
     if interject:
         system += "\n\n" + INTERJECT_NOTE
     msgs = [{"role": "system", "content": system}]
@@ -298,14 +398,15 @@ async def build_prompt(m, interject):
 
 async def respond(m, called, interject):
     started = time.monotonic()
-    ctx = {"channel_id": m.channel.id, "user_id": m.author.id, "guild_id": m.guild.id if m.guild else 0}
+    ctx = {"channel_id": m.channel.id, "user_id": m.author.id, "guild_id": m.guild.id if m.guild else 0,
+           "image_ok": image_ok, "kb": memory.kb(m.guild.id)[0] if m.guild else ""}
     try:
         async with m.channel.typing():
             await see_images(m)
             ref = m.reference.resolved if m.reference else None
             if isinstance(ref, discord.Message):
                 await see_images(ref)
-            msgs, people = await build_prompt(m, interject)
+            msgs, people = await build_prompt(m, interject, with_kb=bool(HELP_RX.search(m.content)) or is_newbie(m.author))
             answer = await brain.chat(msgs, ctx)
     except RateLimited:
         log.warning("лимит Groq")
@@ -317,7 +418,7 @@ async def respond(m, called, interject):
         if called:
             await m.reply("чёт я завис, повтори", mention_author=False)
         return
-    answer = save_facts(answer, people, m.guild.id if m.guild else 0)
+    answer = save_facts(answer, people, m.guild.id if m.guild else 0, author=m.author)
     if "[молчу]" in answer or (not answer and not ctx.get("files")):
         return
     log.info("ответ %s (%s) в #%s", "по зову" if called else "сам", ctx.get("model"), getattr(m.channel, "name", "лс"))
@@ -327,7 +428,7 @@ async def respond(m, called, interject):
         name, text = ctx["paste"]
         store.used_paste(ctx["guild_id"], name)
         await asyncio.sleep(0.6)
-        await send_long(m.channel, text)
+        await send_long(m.channel, text[:PASTE_MAX], mentions=discord.AllowedMentions.none())
 
 
 async def handle_voice(m):
@@ -393,16 +494,24 @@ async def on_message(m):
     if m.guild:
         pending[m.channel.id] = pending.get(m.channel.id, 0) + 1
         last_activity[m.channel.id] = time.time()
-    voice = is_voice(m) and await handle_voice(m)
+        if KB_CHANNEL_RX.search(m.channel.name):
+            kb_dirty.add(m.guild.id)
     called = is_called(m)
+    if called and flooding(m.author.id):
+        log.info("антифлуд: игнор %s", m.author.display_name)
+        return
+    voice = is_voice(m) and await handle_voice(m)
+    called = called or is_called(m)
     interject = False
     if not called:
         if muted(m.channel.id):
             return
         now = time.time()
         ch = m.channel.id
-        if (now - last_interject.get(ch, 0) > INTERJECT_COOLDOWN and now - last_judge.get(ch, 0) > JUDGE_COOLDOWN
-                and (voice or image_atts(m) or (len(m.content) > 8 and random.random() < JUDGE_CHANCE))):
+        helpq = bool(HELP_RX.search(m.content)) and "?" in m.content
+        if ((helpq or now - last_interject.get(ch, 0) > INTERJECT_COOLDOWN) and now - last_judge.get(ch, 0) > JUDGE_COOLDOWN
+                and (helpq or voice or image_atts(m) or (len(m.content) > 8 and random.random() < JUDGE_CHANCE))
+                and cap_ok("judge")):
             last_judge[ch] = now
             if await worth_it(m):
                 interject = True
@@ -431,7 +540,10 @@ async def paste_from_reply(m):
             ref = await m.channel.fetch_message(m.reference.message_id)
         except discord.HTTPException:
             return False
-    text = ref.content.strip()
+    text = ref.content.strip()[:PASTE_MAX]
+    if paste_count(m.guild.id, m.author.id) >= PASTES_PER_USER:
+        await m.reply(f"у тебя уже {PASTES_PER_USER} паст, хватит засирать базу", mention_author=False)
+        return True
     if not text:
         await m.reply("там нет текста, чё мне сохранять, воздух?", mention_author=False)
         return True
@@ -526,12 +638,15 @@ async def c_roast(inter: discord.Interaction, кого: discord.Member):
     await guarded(inter, say(gid(inter), people,
                              f"{inter.user.display_name} просит прожарить {кого.display_name}. Жёстко прожарь "
                              f"{кого.display_name} в 2–4 предложениях, используя то, что о нём знаешь. "
-                             f"Обращайся к нему как <@{кого.id}>."))
+                             f"Обращайся к нему как <@{кого.id}>.", special=specials([кого])))
 
 
 @tree.command(name="нарисуй", description="Нарисовать картинку")
 @app_commands.describe(что="Что нарисовать (можно по-русски)")
 async def c_draw(inter: discord.Interaction, что: str):
+    if not image_ok(inter.user.id):
+        await inter.response.send_message(f"не больше {IMAGES_PER_USER_HOUR} картинок в час, художник хуев", ephemeral=True)
+        return
     await inter.response.defer(thinking=True)
     try:
         m = await router.complete([{"role": "user", "content": "Переведи на английский и подробно опиши для генератора "
@@ -548,7 +663,8 @@ async def c_draw(inter: discord.Interaction, что: str):
         await inter.followup.send("кисточка сломалась, попробуй позже")
 
 
-@tree.command(name="статистика", description="Расход нейросетей за сегодня (видишь только ты)")
+@tree.command(name="статистика", description="Расход нейросетей за сегодня (для админов)")
+@app_commands.default_permissions(manage_guild=True)
 async def c_stats(inter: discord.Interaction):
     rows = router.report()
     lines = [f"`{p}:{m}` — {req} запр., ошибок {err}, токенов {ti}+{to}" for p, m, req, err, ti, to in rows]
@@ -581,11 +697,19 @@ async def c_paste(inter: discord.Interaction, название: str = ""):
         await inter.followup.send(text[k:k + 2000], allowed_mentions=discord.AllowedMentions.none())
 
 
+def paste_count(guild_id, user_id):
+    store._pastes_table()
+    return store.db.execute("SELECT COUNT(*) FROM pastes WHERE guild_id=? AND author_id=?", (guild_id, user_id)).fetchone()[0]
+
+
 class PasteModal(discord.ui.Modal, title="Новая паста"):
     name = discord.ui.TextInput(label="Название", max_length=60, placeholder="например: батя в здании")
     text = discord.ui.TextInput(label="Текст пасты", style=discord.TextStyle.paragraph, max_length=4000)
 
     async def on_submit(self, inter: discord.Interaction):
+        if paste_count(gid(inter), inter.user.id) >= PASTES_PER_USER:
+            await inter.response.send_message(f"у тебя уже {PASTES_PER_USER} паст, удали старые", ephemeral=True)
+            return
         name, existed = store.add_paste(gid(inter), str(self.name), str(self.text), inter.user.id)
         await inter.response.send_message(f"📋 паста **{name}** {'обновлена' if existed else 'сохранена'}. вызывать: `/паста {name}`")
 
@@ -716,7 +840,8 @@ async def _duel(inter, a, b, winner, loser, people):
     story = await say(g, people,
                       f"Опиши дуэль {a.display_name} против {b.display_name} в 3–5 коротких строках, жёстко и смешно, "
                       f"оружие: {random.choice(weapons)}. Победит {winner.display_name}, проиграет {loser.display_name} — "
-                      "унизительно. Используй то, что о них знаешь. Без заголовка, без итоговой строки.", max_tokens=400)
+                      "унизительно. Используй то, что о них знаешь. Без заголовка, без итоговой строки.", max_tokens=400,
+                      special=specials([x for x in (a, b) if isinstance(x, discord.Member)]))
     if winner.id != client.user.id:
         store.add_score(g, winner.id, "duel_win")
     if loser.id != client.user.id:
@@ -795,11 +920,23 @@ async def c_loh(inter: discord.Interaction):
     await inter.followup.send(text or "некого выбирать, вы все молчите", allowed_mentions=MENTIONS)
 
 
-@tree.command(name="лохдня_тут", description="Объявлять лоха дня в этом канале")
+@tree.command(name="лохдня_тут", description="Объявлять лоха дня в этом канале (для админов)")
 @app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 async def c_loh_here(inter: discord.Interaction):
     store.put(inter.guild.id, "loh_channel", inter.channel.id)
     await inter.response.send_message(f"ок, лоха дня объявляю здесь, каждый день в {LOH_HOUR}:00")
+
+
+@tree.command(name="обновить_инфо", description="Перечитать инфо-каналы и пересобрать базу знаний сервера (для админов)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def c_kb(inter: discord.Interaction):
+    await inter.response.defer(thinking=True, ephemeral=True)
+    ok = await build_guild_kb(inter.guild)
+    kb, _ = memory.kb(inter.guild.id)
+    await inter.followup.send(("✅ база знаний собрана:\n" if ok else "✕ не получилось (лимит или нет инфо-каналов), текущая:\n")
+                              + (kb or "(пусто)")[:1800], ephemeral=True)
 
 
 @tree.command(name="заткнись", description="Бот перестанет сам влезать в этот канал")
@@ -905,7 +1042,9 @@ async def reminder_loop():
             ["давай, шевели булками", "не благодари", "опять бы забыл, склеротик", "я тебе не секретарь, но ладно"])
         try:
             ch = client.get_channel(r["channel_id"]) or await client.fetch_channel(r["channel_id"])
-            await send_long(ch, text)
+            # пингуем только хозяина напоминания, что бы он туда ни написал
+            await send_long(ch, text, mentions=discord.AllowedMentions(users=[discord.Object(id=r["user_id"])],
+                                                                        everyone=False, roles=False))
         except Exception:
             try:
                 user = await client.fetch_user(r["user_id"])
@@ -918,11 +1057,46 @@ async def reminder_loop():
 scan_lock = asyncio.Lock()
 
 
+def readable(ch):
+    p = ch.permissions_for(ch.guild.me)
+    return p.view_channel and p.read_message_history
+
+
+def full_text(m):
+    """Текст сообщения вместе с embed-блоками (правила и инфо часто постят ботом в embed)."""
+    parts = [m.content]
+    for e in m.embeds:
+        parts += [e.title or "", e.description or ""]
+        parts += [f"{f.name}: {f.value}" for f in e.fields]
+    return "\n".join(x for x in parts if x).strip()
+
+
+async def build_guild_kb(guild):
+    chans = [c for c in guild.text_channels if KB_CHANNEL_RX.search(c.name) and readable(c)]
+    lines = ["[все каналы сервера: " + ", ".join(f"#{c.name} id={c.id}" for c in guild.text_channels if readable(c))[:3000] + "]"]
+    for c in chans:
+        msgs = [m async for m in c.history(limit=KB_LIMIT)]
+        msgs.reverse()
+        body = "\n".join(f"{m.author.display_name}: {full_text(m)[:1500]}" for m in msgs if full_text(m))
+        if body:
+            lines.append(f"[канал #{c.name} id={c.id}]\n{body[:6000]}")
+    log.info("база знаний %s: инфо-каналы %s", guild.name, ", ".join("#" + c.name for c in chans) or "не найдены")
+    kb_dirty.discard(guild.id)
+    return await memory.build_kb(guild.id, lines)
+
+
 async def scan_guild(guild):
     async with scan_lock:
-        for ch in guild.text_channels:
-            perms = ch.permissions_for(guild.me)
-            if not (perms.view_channel and perms.read_message_history) or store.is_scanned(ch.id):
+        if not memory.kb(guild.id)[0]:
+            try:
+                await build_guild_kb(guild)
+            except Exception:
+                log.exception("база знаний %s", guild.name)
+        # самые живые каналы, кроме инфо (их уже прочитали для базы)
+        chans = [c for c in guild.text_channels if readable(c) and not KB_CHANNEL_RX.search(c.name)]
+        chans.sort(key=lambda c: c.last_message_id or 0, reverse=True)
+        for ch in chans[:SCAN_CHANNELS]:
+            if store.is_scanned(ch.id):
                 continue
             try:
                 await scan_channel(guild, ch)
@@ -954,6 +1128,9 @@ async def scan_channel(guild, ch):
             names.setdefault(m.author.name.lower(), m.author.id)
         text = "\n".join(line for _, line in chunk)
         r = None
+        if not cap_ok("scan"):
+            log.warning("дневной лимит чтения истории — #%s дочитаю завтра", ch.name)
+            return
         for _ in range(4):
             try:
                 r = await router.complete([{"role": "system", "content": SCAN_PROMPT}, {"role": "user", "content": text}],
@@ -1020,6 +1197,8 @@ async def summary_loop():
             pending[cid] = 0
             continue
         lines = [f"{'(бот) ' if m.author == client.user else ''}{m.author.display_name}: {msg_text(m)[:300]}" for m in msgs]
+        if not cap_ok("summary"):
+            return
         if await memory.summarize(cid, ch.guild.id, ch.name, lines, msgs[-1].id):
             pending[cid] = 0
 
@@ -1040,6 +1219,11 @@ async def maintenance_loop():
 @tasks.loop(hours=1)
 async def scan_loop():
     for guild in client.guilds:
+        if guild.id in kb_dirty:
+            try:
+                await build_guild_kb(guild)
+            except Exception:
+                log.exception("база знаний %s", guild.name)
         await scan_guild(guild)
 
 
@@ -1081,6 +1265,8 @@ async def on_guild_join(guild):
 
 
 if __name__ == "__main__":
+    import os
+    os.umask(0o077)                     # база, логи, копии — только владельцу
     from logging.handlers import RotatingFileHandler
     LOG_DIR.mkdir(exist_ok=True)
     fh = RotatingFileHandler(LOG_DIR / "bot.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")

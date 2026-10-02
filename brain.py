@@ -8,7 +8,7 @@ from datetime import datetime
 
 import httpx
 
-from config import TZ
+from config import REMINDERS_PER_USER, TZ
 from llm import RateLimited  # noqa: F401 — реэкспорт для bot.py
 
 log = logging.getLogger("poskinson.brain")
@@ -36,10 +36,14 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "generate_image",
-        "description": "Нарисовать картинку, когда просят нарисовать/сгенерировать/показать картинку. Картинка приложится к твоему ответу.",
+        "description": "Нарисовать картинку, когда просят нарисовать/сгенерировать/показать картинку. Картинка приложится к твоему ответу. Не рисуешь откровенное/18+, жестокость, детей в сомнительном контексте, реальных людей в унизительном виде — откажи в своём стиле.",
         "parameters": {"type": "object", "properties": {
             "prompt_en": {"type": "string", "description": "Подробное описание картинки НА АНГЛИЙСКОМ: объект, стиль, детали"}},
             "required": ["prompt_en"]}}},
+    {"type": "function", "function": {
+        "name": "server_info",
+        "description": "База знаний ЭТОГО Майнкрафт-сервера: как зайти, IP, версия, правила, заявки, донат, каналы, анонсы. Вызывай на любой вопрос про сам сервер.",
+        "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "send_paste",
         "description": "Кинуть пасту (копипасту) сервера: когда просят пасту или она идеально к месту. Паста отправится целиком после твоего короткого комментария.",
@@ -68,7 +72,13 @@ class Brain:
     # ---------- ответ в чат с инструментами ----------
     async def chat(self, messages, ctx):
         """ctx: dict(channel_id, user_id) — для напоминаний."""
-        text = await self._chat(messages, ctx)
+        try:
+            text = await self._chat(messages, ctx)
+        except RateLimited:
+            # вся болтовня в лимите — резерв без инструментов, лишь бы не молчать
+            m = await self.complete(messages, role="fallback")
+            ctx["model"] = m.get("_model")
+            text = clean_text(m.get("content") or "")
         if CJK.search(text):
             # Qwen иногда срывается в китайский: одна повторная попытка, потом вырезаем
             log.info("иероглифы в ответе, переспрашиваю")
@@ -78,12 +88,21 @@ class Brain:
 
     async def _chat(self, messages, ctx):
         msgs = list(messages)
+        said = []                              # текст, который модель написала вместе с вызовом инструмента
         for _ in range(4):
             m = await self.complete(msgs, tools=TOOLS)
             ctx["model"] = m.get("_model")
             calls = m.get("tool_calls") or []
             if not calls:
-                return clean_text(m.get("content") or "")
+                final = clean_text(m.get("content") or "")
+                visible = re.sub(r"(?im)^\s*(?:запомни|отношение)\b.*$", "", final).strip()
+                if not visible and not said:
+                    # модель ответила одними служебными строками — переспросить без инструментов
+                    m2 = await self.complete(msgs + [{"role": "system", "content": "Ответь человеку текстом, коротко."}])
+                    final = clean_text(m2.get("content") or "") + ("\n" + final if final else "")
+                return "\n".join(x for x in said + [final] if x and x not in final) if said else final
+            if (m.get("content") or "").strip():
+                said.append(clean_text(m["content"]))
             msgs.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": calls})
             for c in calls:
                 try:
@@ -105,10 +124,15 @@ class Brain:
             if name == "set_reminder":
                 return self.set_reminder(args, ctx)
             if name == "generate_image":
+                if ctx.get("image_ok") and not ctx["image_ok"](ctx["user_id"]):
+                    return "лимит картинок для этого человека на час исчерпан — скажи ему подождать"
                 prompt = (args.get("prompt_en") or "").strip()
                 if not prompt:
                     return "нужно описание"
-                data, fname, src = await self.media.generate(prompt)
+                try:
+                    data, fname, src = await self.media.generate(prompt)
+                except ValueError:
+                    return "такое не рисую (18+/жесть) — откажи в своём стиле"
                 ctx.setdefault("files", []).append((data, fname))
                 return f"картинка готова ({src}) и будет приложена к ответу, просто прокомментируй её"
             if name == "send_gif":
@@ -117,6 +141,9 @@ class Brain:
                     return "гифки сейчас недоступны, обойдись словами"
                 ctx["gif"] = url
                 return "гифка будет отправлена после твоего ответа"
+            if name == "server_info":
+                kb = ctx.get("kb") or ""
+                return kb or "база знаний сервера пока пустая — отправь человека в инфо-каналы и к админам, ничего не выдумывай"
             if name == "send_paste":
                 gid = ctx.get("guild_id", 0)
                 q = (args.get("query") or "").strip()
@@ -137,6 +164,8 @@ class Brain:
         return "нет такого инструмента"
 
     def set_reminder(self, args, ctx):
+        if len(self.store.user_reminders(ctx["user_id"])) >= REMINDERS_PER_USER:
+            return f"у него уже {REMINDERS_PER_USER} напоминаний — больше нельзя"
         when = (args.get("when") or "").strip()
         try:
             dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
@@ -170,12 +199,39 @@ class Brain:
     async def open_page(self, url):
         if not re.match(r"^https?://", url or ""):
             return "нужна ссылка http(s)"
-        r = await self.web.get(url)
+        if not await public_url(url):
+            return "эту ссылку открыть нельзя"
+        r = await self.web.get(url, follow_redirects=False)
+        for _ in range(3):                      # редиректы — тоже только наружу
+            if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
+                nxt = str(r.next_request.url) if r.next_request else r.headers["location"]
+                if not await public_url(nxt):
+                    return "эту ссылку открыть нельзя"
+                r = await self.web.get(nxt, follow_redirects=False)
         text = r.text
         text = re.sub(r"(?is)<(script|style|noscript|svg|head).*?</\1>", " ", text)
         text = re.sub(r"(?s)<[^>]+>", " ", text)
         text = html.unescape(re.sub(r"\s+", " ", text)).strip()
         return text[:3000] or "страница пустая"
+
+
+async def public_url(url):
+    """Только внешние адреса: никаких localhost, домашней сети и служебных IP (защита от SSRF)."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(url)
+        if u.scheme not in ("http", "https") or not u.hostname or (u.port and u.port not in (80, 443)):
+            return False
+        infos = await asyncio.get_running_loop().getaddrinfo(u.hostname, u.port or 443, type=socket.SOCK_STREAM)
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if not ip.is_global:
+                return False
+        return bool(infos)
+    except Exception:
+        return False
 
 
 CJK = re.compile(r"[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uff00-\uffef]+")
