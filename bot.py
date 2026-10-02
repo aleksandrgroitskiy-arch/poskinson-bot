@@ -835,7 +835,7 @@ async def scan_channel(guild, ch):
         for _ in range(4):
             try:
                 r = await router.complete([{"role": "system", "content": SCAN_PROMPT}, {"role": "user", "content": text}],
-                                          role="light", max_tokens=1200, temperature=0.3)
+                                          role="memory", max_tokens=1200, temperature=0)
                 break
             except RateLimited:
                 await asyncio.sleep(90)

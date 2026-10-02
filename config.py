@@ -68,6 +68,15 @@ MODELS = {
         ("openrouter", "nvidia/nemotron-3.5-lightning:free"),
         ("groq", "qwen/qwen3.8-27b"),
     ],
+    # память: карточки и сводки — нужна аккуратность (маленькие модели присочиняют)
+    "memory": [
+        ("cerebras", "gpt-oss-120b"),
+        ("nvidia", "deepseek-ai/deepseek-v4.1-flash"),
+        ("nvidia", "moonshotai/kimi-k2.6"),
+        ("github", "openai/gpt-4.1-mini"),
+        ("groq", "qwen/qwen3.8-27b"),
+        ("groq", "openai/gpt-oss-120b"),
+    ],
     "vision": [
         ("openrouter", "google/gemma-4-31b-it:free"),
         ("nvidia", "google/gemma-4-31b-it"),
