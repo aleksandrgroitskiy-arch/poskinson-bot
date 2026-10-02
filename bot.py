@@ -73,6 +73,7 @@ def muted(channel_id):
 def emoji_block(guild):
     if not guild:
         return ""
+    pastes = [n for n, _ in store.paste_names(guild.id, limit=40)]
     em = [f":{e.name}:" for e in guild.emojis if e.available][:40]
     st = [s.name for s in guild.stickers][:20]
     out = ""
@@ -81,6 +82,8 @@ def emoji_block(guild):
     if st:
         out += ("\n- Совсем изредка можешь отправить стикер сервера строкой [стикер: имя] в конце ответа "
                 "(только эти): " + ", ".join(st))
+    if pastes:
+        out += "\n- Пасты сервера (send_paste — когда просят пасту или очень к месту, редко): " + ", ".join(pastes)
     return out
 
 
@@ -295,7 +298,7 @@ async def build_prompt(m, interject):
 
 async def respond(m, called, interject):
     started = time.monotonic()
-    ctx = {"channel_id": m.channel.id, "user_id": m.author.id}
+    ctx = {"channel_id": m.channel.id, "user_id": m.author.id, "guild_id": m.guild.id if m.guild else 0}
     try:
         async with m.channel.typing():
             await see_images(m)
@@ -320,6 +323,11 @@ async def respond(m, called, interject):
     log.info("ответ %s (%s) в #%s", "по зову" if called else "сам", ctx.get("model"), getattr(m.channel, "name", "лс"))
     await send_reply(m.channel, answer, reference=m if called else None, started=started,
                      files=ctx.get("files", ()), gif=ctx.get("gif"))
+    if ctx.get("paste"):
+        name, text = ctx["paste"]
+        store.used_paste(ctx["guild_id"], name)
+        await asyncio.sleep(0.6)
+        await send_long(m.channel, text)
 
 
 async def handle_voice(m):
@@ -379,6 +387,8 @@ async def on_message(m):
         return
     if m.guild and await check_quiz(m):
         return
+    if m.guild and await paste_from_reply(m):
+        return
 
     if m.guild:
         pending[m.channel.id] = pending.get(m.channel.id, 0) + 1
@@ -405,6 +415,30 @@ async def on_message(m):
                     pass
             return
     await respond(m, called, interject)
+
+
+PASTE_SAVE_RX = re.compile(r"(?:запомни|сохрани|добавь|запиши)\s+(?:это\s+)?(?:как\s+)?пасту\s*(.*)", re.I | re.S)
+
+
+async def paste_from_reply(m):
+    """Ответом на сообщение: «поскинсон, запомни пасту <название>» — текст того сообщения становится пастой."""
+    mt = PASTE_SAVE_RX.search(m.content)
+    if not mt or not m.reference or not is_called(m):
+        return False
+    ref = m.reference.resolved
+    if not isinstance(ref, discord.Message):
+        try:
+            ref = await m.channel.fetch_message(m.reference.message_id)
+        except discord.HTTPException:
+            return False
+    text = ref.content.strip()
+    if not text:
+        await m.reply("там нет текста, чё мне сохранять, воздух?", mention_author=False)
+        return True
+    name = mt.group(1).strip().strip("«»\"'.,:").strip() or " ".join(text.split()[:4])
+    name, existed = store.add_paste(m.guild.id, name, text, m.author.id)
+    await m.reply(f"📋 паста **{name}** {'обновлена' if existed else 'сохранена'}. вызывать: `/паста {name}`", mention_author=False)
+    return True
 
 
 async def worth_it(m):
@@ -460,6 +494,7 @@ async def c_help(inter: discord.Interaction):
         "(«поскинсон, напомни через 2 часа…»).\n"
         "**Игры:** /лохдня, /дуэль, /рулетка, /кости, /шар, /викторина, /очки\n"
         "**Болтовня:** /прожарка, /анекдот, /совет, /нарисуй\n"
+        "**Пасты:** /паста, /паста_добавить, /пасты, /паста_удалить — или ответь на сообщение «поскинсон, запомни пасту <название>»\n"
         "**Служебное:** /заткнись, /говори, /напоминания, /отменить, /чтознаешь, /забудь, /лохдня_тут, /статистика\n"
         f"версия {VERSION}",
         ephemeral=True)
@@ -522,6 +557,70 @@ async def c_stats(inter: discord.Interaction):
         f"**poskinson {VERSION}**, провайдеры: {', '.join(router.clients) or 'нет'}\n"
         f"доступно моделей сейчас — болтовня: {roles['chat']}, служебных: {roles['light']}, зрение: {roles['vision']}\n"
         + ("\n".join(lines) or "сегодня ещё ничего не тратил"), ephemeral=True)
+
+
+async def paste_autocomplete(inter: discord.Interaction, current: str):
+    return [app_commands.Choice(name=f"{n} ({u})"[:100], value=n) for n, u in store.paste_names(gid(inter), current)]
+
+
+@tree.command(name="паста", description="Кинуть пасту: по названию или случайную")
+@app_commands.describe(название="Название или слово из пасты; пусто — случайная")
+@app_commands.autocomplete(название=paste_autocomplete)
+async def c_paste(inter: discord.Interaction, название: str = ""):
+    g = gid(inter)
+    row = store.find_paste(g, название) if название.strip() else store.random_paste(g)
+    if not row:
+        names = [n for n, _ in store.paste_names(g, limit=15)]
+        await inter.response.send_message(
+            ("нет такой пасты. есть: " + ", ".join(names)) if names else "паст ещё нет, добавь: /паста_добавить", ephemeral=True)
+        return
+    store.used_paste(g, row["name"])
+    text = row["text"]
+    await inter.response.send_message(text[:2000], allowed_mentions=discord.AllowedMentions.none())
+    for k in range(2000, len(text), 2000):
+        await inter.followup.send(text[k:k + 2000], allowed_mentions=discord.AllowedMentions.none())
+
+
+class PasteModal(discord.ui.Modal, title="Новая паста"):
+    name = discord.ui.TextInput(label="Название", max_length=60, placeholder="например: батя в здании")
+    text = discord.ui.TextInput(label="Текст пасты", style=discord.TextStyle.paragraph, max_length=4000)
+
+    async def on_submit(self, inter: discord.Interaction):
+        name, existed = store.add_paste(gid(inter), str(self.name), str(self.text), inter.user.id)
+        await inter.response.send_message(f"📋 паста **{name}** {'обновлена' if existed else 'сохранена'}. вызывать: `/паста {name}`")
+
+
+@tree.command(name="паста_добавить", description="Добавить пасту (откроется окно для текста)")
+async def c_paste_add(inter: discord.Interaction):
+    await inter.response.send_modal(PasteModal())
+
+
+@tree.command(name="пасты", description="Список паст сервера")
+async def c_pastes(inter: discord.Interaction):
+    rows = store.paste_names(gid(inter), limit=100)
+    if not rows:
+        await inter.response.send_message("паст нет. добавь: /паста_добавить или ответь на сообщение «поскинсон, запомни пасту <название>»",
+                                          ephemeral=True)
+        return
+    text = "📋 **пасты** (название — сколько раз кидали):\n" + "\n".join(f"• {n} — {u}" for n, u in rows)
+    await inter.response.send_message(text[:2000], ephemeral=True)
+
+
+@tree.command(name="паста_удалить", description="Удалить пасту")
+@app_commands.describe(название="Какую")
+@app_commands.autocomplete(название=paste_autocomplete)
+async def c_paste_del(inter: discord.Interaction, название: str):
+    g = gid(inter)
+    row = store.get_paste(g, название)
+    if not row:
+        await inter.response.send_message("нет такой пасты", ephemeral=True)
+        return
+    perms = getattr(inter.user, "guild_permissions", None)
+    if row["author_id"] != inter.user.id and not (perms and perms.manage_messages):
+        await inter.response.send_message("удалять может автор пасты или модеры. а ты ни то ни другое", ephemeral=True)
+        return
+    store.delete_paste(g, название)
+    await inter.response.send_message(f"🗑️ паста **{row['name']}** удалена")
 
 
 @tree.command(name="кости", description="Бросить кости, например 2d6 или 1d20+3")

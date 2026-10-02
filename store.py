@@ -125,3 +125,57 @@ class Store:
     def mark_scanned(self, channel_id):
         self.db.execute("INSERT OR REPLACE INTO scanned VALUES (?,?)", (channel_id, time.time()))
         self.db.commit()
+
+    # ---- пасты ----
+    def _pastes_table(self):
+        self.db.execute("CREATE TABLE IF NOT EXISTS pastes (guild_id INTEGER, name TEXT, text TEXT, author_id INTEGER,"
+                        " created REAL, uses INTEGER DEFAULT 0, PRIMARY KEY (guild_id, name))")
+
+    def add_paste(self, guild_id, name, text, author_id):
+        self._pastes_table()
+        name = " ".join(name.lower().split())[:60]
+        existed = self.get_paste(guild_id, name) is not None
+        self.db.execute("INSERT OR REPLACE INTO pastes (guild_id, name, text, author_id, created, uses) VALUES (?,?,?,?,?,"
+                        " COALESCE((SELECT uses FROM pastes WHERE guild_id=? AND name=?), 0))",
+                        (guild_id, name, text, author_id, time.time(), guild_id, name))
+        self.db.commit()
+        return name, existed
+
+    def get_paste(self, guild_id, name):
+        self._pastes_table()
+        return self.db.execute("SELECT * FROM pastes WHERE guild_id=? AND name=?",
+                               (guild_id, " ".join(name.lower().split()))).fetchone()
+
+    def find_paste(self, guild_id, query):
+        """Точное имя → начало имени → подстрока в имени → подстрока в тексте."""
+        self._pastes_table()
+        q = " ".join((query or "").lower().split())
+        if not q:
+            return None
+        for sql, arg in (("name=?", q), ("name LIKE ?", q + "%"), ("name LIKE ?", "%" + q + "%"),
+                         ("LOWER(text) LIKE ?", "%" + q + "%")):
+            r = self.db.execute(f"SELECT * FROM pastes WHERE guild_id=? AND {sql} ORDER BY uses DESC LIMIT 1",
+                                (guild_id, arg)).fetchone()
+            if r:
+                return r
+        return None
+
+    def random_paste(self, guild_id):
+        self._pastes_table()
+        return self.db.execute("SELECT * FROM pastes WHERE guild_id=? ORDER BY RANDOM() LIMIT 1", (guild_id,)).fetchone()
+
+    def paste_names(self, guild_id, prefix="", limit=25):
+        self._pastes_table()
+        rows = self.db.execute("SELECT name, uses FROM pastes WHERE guild_id=? AND name LIKE ? ORDER BY uses DESC, name LIMIT ?",
+                               (guild_id, "%" + " ".join(prefix.lower().split()) + "%", limit)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def used_paste(self, guild_id, name):
+        self.db.execute("UPDATE pastes SET uses=uses+1 WHERE guild_id=? AND name=?", (guild_id, name))
+        self.db.commit()
+
+    def delete_paste(self, guild_id, name):
+        self._pastes_table()
+        n = self.db.execute("DELETE FROM pastes WHERE guild_id=? AND name=?", (guild_id, " ".join(name.lower().split()))).rowcount
+        self.db.commit()
+        return n

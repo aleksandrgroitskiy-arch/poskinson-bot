@@ -41,6 +41,11 @@ TOOLS = [
             "prompt_en": {"type": "string", "description": "Подробное описание картинки НА АНГЛИЙСКОМ: объект, стиль, детали"}},
             "required": ["prompt_en"]}}},
     {"type": "function", "function": {
+        "name": "send_paste",
+        "description": "Кинуть пасту (копипасту) сервера: когда просят пасту или она идеально к месту. Паста отправится целиком после твоего короткого комментария.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Название пасты или о чём она; пусто — случайная"}}}}},
+    {"type": "function", "function": {
         "name": "send_gif",
         "description": "Добавить гифку-реакцию ПОСЛЕ твоего текстового ответа (не вместо него — текст пиши всё равно полностью). Изредка, не чаще раза в 10 ответов, и никогда, если просят анекдот, совет или информацию.",
         "parameters": {"type": "object", "properties": {
@@ -112,6 +117,15 @@ class Brain:
                     return "гифки сейчас недоступны, обойдись словами"
                 ctx["gif"] = url
                 return "гифка будет отправлена после твоего ответа"
+            if name == "send_paste":
+                gid = ctx.get("guild_id", 0)
+                q = (args.get("query") or "").strip()
+                row = self.store.find_paste(gid, q) if q else self.store.random_paste(gid)
+                if not row:
+                    names = [n for n, _ in self.store.paste_names(gid, limit=40)]
+                    return ("такой пасты нет. есть: " + ", ".join(names)) if names else "паст пока нет вообще"
+                ctx["paste"] = (row["name"], row["text"])
+                return f"паста «{row['name']}» будет отправлена после твоего ответа; сам её текст не повторяй"
             if name == "list_reminders":
                 rows = self.store.user_reminders(ctx["user_id"])
                 if not rows:
