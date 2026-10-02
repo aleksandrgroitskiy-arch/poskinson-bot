@@ -1,0 +1,719 @@
+"""poskinson — грубый Discord-бот для развлечения (Groq, бесплатный тариф).
+
+Отвечает, когда зовут (упоминание, ответ ему, имя, личка), иногда сам влезает;
+слушает голосовые; ищет в интернете; ставит напоминания; помнит людей (SQLite) и
+при появлении на сервере читает историю каналов, чтобы узнать, кто есть кто.
+Развлечения — slash-команды: /лохдня /дуэль /рулетка /кости /шар /викторина /очки
+/прожарка /анекдот /совет /заткнись /говори /напоминания /отменить /чтознаешь /забудь /помощь.
+Характер и настройки — config.py, ключи — .env.
+"""
+import asyncio
+import json
+import logging
+import random
+import re
+import time
+from datetime import datetime, timedelta
+
+import discord
+from discord import app_commands
+from discord.ext import tasks
+
+from brain import Brain, RateLimited
+from config import (CALL_RX, HISTORY, INTERJECT_CHANCE, INTERJECT_COOLDOWN, INTERJECT_NOTE, LOH_HOUR, NAME,
+                    PERSONA, QUIZ_SECONDS, REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SCAN_CHUNK_CHARS,
+                    SCAN_LIMIT, SCAN_MODELS, SCAN_PAUSE, SCAN_PROMPT, TOKEN, TZ, VOICE_REPLY_CHANCE, DB_PATH)
+from store import Store
+
+log = logging.getLogger("poskinson")
+
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+store = Store(DB_PATH)
+brain = Brain(store)
+
+last_interject = {}     # channel_id → время последнего вмешательства
+muted_until = {}        # channel_id → до какого времени молчит сам
+last_channel = {}       # guild_id → последний живой канал (для «лоха дня»)
+transcripts = {}        # message_id → текст голосового
+quizzes = {}            # channel_id → активная викторина
+FACT_RX = re.compile(r"^\s*ЗАПОМНИ:\s*(.+?)\s*\|\s*(.+?)\s*$", re.M)
+TIRED = "мана кончилась, дай реген пару минут"
+MENTIONS = discord.AllowedMentions(users=True, everyone=False, roles=False)
+
+
+# ======================= помощники =======================
+def now_line():
+    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    n = datetime.now(TZ)
+    return f"Сейчас {n:%d.%m.%Y %H:%M}, {days[n.weekday()]} (Москва)."
+
+
+def muted(channel_id):
+    return muted_until.get(channel_id, 0) > time.time()
+
+
+def memory_block(guild_id, people):
+    lines = []
+    for uid, name in people.items():
+        f = store.facts(uid)
+        if f:
+            lines.append(f"{name}: " + "; ".join(f))
+    if guild_id:
+        sf = store.server_facts(guild_id)
+        if sf:
+            lines.append("Сервер (общие мемы): " + "; ".join(sf))
+    return "Память о людях в чате:\n" + ("\n".join(lines) or "(пока ничего)")
+
+
+def save_facts(text, people, guild_id):
+    by_name = {n.lower(): uid for uid, n in people.items()}
+    for name, fact in FACT_RX.findall(text):
+        key = name.strip().lstrip("@").lower()
+        if key == "сервер" and guild_id:
+            if store.add_fact(0, "сервер", fact, guild_id):
+                log.info("запомнил о сервере: %s", fact)
+        elif key in by_name:
+            if store.add_fact(by_name[key], name.strip(), fact, guild_id or 0):
+                log.info("запомнил: %s | %s", name, fact)
+    return FACT_RX.sub("", text).strip()
+
+
+def msg_text(m):
+    text = m.clean_content
+    if m.id in transcripts:
+        text = (text + " " if text else "") + f"[голосовое: {transcripts[m.id]}]"
+    elif m.attachments:
+        text += " [вложение: " + ", ".join(a.filename for a in m.attachments) + "]"
+    return text
+
+
+def is_voice(m):
+    if getattr(m.flags, "voice", False):
+        return True
+    return any(getattr(a, "is_voice_message", lambda: False)() for a in m.attachments)
+
+
+async def send_long(channel, text, reference=None):
+    text = text.strip() or "…"
+    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)]
+    for i, c in enumerate(chunks):
+        await channel.send(c, reference=reference if i == 0 else None, mention_author=False, allowed_mentions=MENTIONS)
+
+
+async def say(guild_id, people, instruction, max_tokens=500):
+    """Короткая реплика в характере по заданию (для команд и событий)."""
+    system = PERSONA + "\n" + now_line() + "\n" + memory_block(guild_id, people)
+    m = await brain.complete([{"role": "system", "content": system}, {"role": "user", "content": instruction}],
+                             max_tokens=max_tokens)
+    return save_facts(m.get("content") or "", people, guild_id)
+
+
+def norm(s):
+    s = s.lower().replace("ё", "е")
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip()
+
+
+# ======================= ответы в чате =======================
+def is_called(m):
+    if m.guild is None:
+        return True
+    if client.user in m.mentions:
+        return True
+    ref = m.reference.resolved if m.reference else None
+    if isinstance(ref, discord.Message) and ref.author == client.user:
+        return True
+    return bool(CALL_RX.search(m.content) or CALL_RX.search(transcripts.get(m.id, "")))
+
+
+async def build_prompt(m, interject):
+    history = [x async for x in m.channel.history(limit=HISTORY, before=m)]
+    history.reverse()
+    history.append(m)
+    people = {}
+    for x in history:
+        if not x.author.bot:
+            people[x.author.id] = x.author.display_name
+    gid = m.guild.id if m.guild else 0
+    where = f"Канал #{m.channel.name}." if m.guild else "Личные сообщения."
+    system = PERSONA + "\n" + now_line() + " " + where + "\n" + memory_block(gid, people)
+    if interject:
+        system += "\n\n" + INTERJECT_NOTE
+    msgs = [{"role": "system", "content": system}]
+    for x in history:
+        cap = 1500 if x is m else 500
+        if x.author == client.user:
+            msgs.append({"role": "assistant", "content": x.clean_content[:cap]})
+        else:
+            msgs.append({"role": "user", "content": f"{x.author.display_name}: {msg_text(x)[:cap]}"})
+    return msgs, people
+
+
+async def respond(m, called, interject):
+    try:
+        async with m.channel.typing():
+            msgs, people = await build_prompt(m, interject)
+            answer = await brain.chat(msgs, {"channel_id": m.channel.id, "user_id": m.author.id})
+    except RateLimited:
+        log.warning("лимит Groq")
+        if called:
+            await m.reply(TIRED, mention_author=False)
+        return
+    except Exception:
+        log.exception("ошибка ответа")
+        if called:
+            await m.reply("чёт я завис, повтори", mention_author=False)
+        return
+    answer = save_facts(answer, people, m.guild.id if m.guild else 0)
+    if not answer or "[молчу]" in answer:
+        return
+    await send_long(m.channel, answer, reference=m if called else None)
+
+
+async def handle_voice(m):
+    att = m.attachments[0] if m.attachments else None
+    if not att or att.size > 24 * 1024 * 1024:
+        return False
+    try:
+        data = await att.read()
+        text = await brain.transcribe(data, att.filename or "voice.ogg")
+    except Exception:
+        log.exception("голосовое не распозналось")
+        return False
+    if not text:
+        return False
+    transcripts[m.id] = text
+    if len(transcripts) > 500:
+        for k in list(transcripts)[:100]:
+            transcripts.pop(k, None)
+    log.info("голосовое от %s: %s", m.author.display_name, text[:100])
+    return True
+
+
+async def check_quiz(m):
+    q = quizzes.get(m.channel.id)
+    if not q:
+        return False
+    text = norm(m.content)
+    if not text:
+        return False
+    for ans in q["answers"]:
+        a = norm(ans)
+        if a and re.search(r"(?<!\w)" + re.escape(a) + r"(?!\w)", text):
+            quizzes.pop(m.channel.id, None)
+            q["timer"].cancel()
+            store.add_score(m.guild.id, m.author.id, "quiz")
+            pts = store.score(m.guild.id, m.author.id, "quiz")
+            jab = random.choice(["даже слепая курица иногда находит зерно", "ну надо же, мозг всё-таки есть",
+                                 "повезло, не зазнавайся", "читерил небось, гугл открыт", "окей, сегодня ты не самый тупой"])
+            await m.reply(f"✅ правильно, ответ — **{q['answers'][0]}**. {jab}. очков: {pts}", mention_author=False)
+            return True
+    return False
+
+
+@client.event
+async def on_message(m):
+    if m.author.bot:
+        return
+    if m.guild:
+        store.seen(m.guild.id, m.author.id, m.author.display_name)
+        last_channel[m.guild.id] = m.channel.id
+    t = m.content.strip().lower()
+    if t in ("!чтознаешь", "!что знаешь"):
+        await m.reply(what_i_know(m.author.id), mention_author=False)
+        return
+    if t == "!забудь":
+        await m.reply(forget_text(m.author.id), mention_author=False)
+        return
+    if m.guild and await check_quiz(m):
+        return
+
+    voice = is_voice(m) and await handle_voice(m)
+    called = is_called(m)
+    interject = False
+    if not called:
+        if muted(m.channel.id):
+            return
+        now = time.time()
+        if voice and random.random() < VOICE_REPLY_CHANCE:
+            interject = True
+        elif (now - last_interject.get(m.channel.id, 0) > INTERJECT_COOLDOWN
+              and random.random() < INTERJECT_CHANCE and len(m.content) > 15):
+            interject = True
+            last_interject[m.channel.id] = now
+        if not interject:
+            if random.random() < REACT_CHANCE:
+                try:
+                    await m.add_reaction(random.choice(REACTIONS))
+                except discord.HTTPException:
+                    pass
+            return
+    await respond(m, called, interject)
+
+
+def what_i_know(uid):
+    f = store.facts(uid, limit=30)
+    return ("я про тебя помню:\n- " + "\n- ".join(f)) if f else "про тебя я ничего не помню, ты пустое место"
+
+
+def forget_text(uid):
+    return f"стёр {store.forget(uid)} фактов о тебе. ты снова никто"
+
+
+# ======================= slash-команды =======================
+async def guarded(inter, coro):
+    """Отложенный ответ: нейросеть думает дольше трёх секунд."""
+    await inter.response.defer(thinking=True)
+    try:
+        text = await coro
+    except RateLimited:
+        text = TIRED
+    except Exception:
+        log.exception("команда")
+        text = "чёт сломалось, попробуй позже"
+    await inter.followup.send((text or "…")[:1990], allowed_mentions=MENTIONS)
+
+
+def gid(inter):
+    return inter.guild.id if inter.guild else 0
+
+
+@tree.command(name="помощь", description="Что умеет бот")
+async def c_help(inter: discord.Interaction):
+    await inter.response.send_message(
+        f"**{NAME}** — зови по имени, упоминанием или ответом на моё сообщение, в личке отвечаю всегда. "
+        "Иногда сам влезаю в разговор, слушаю голосовые, умею гуглить и ставить напоминания "
+        "(«поскинсон, напомни через 2 часа…»).\n"
+        "**Игры:** /лохдня, /дуэль, /рулетка, /кости, /шар, /викторина, /очки\n"
+        "**Болтовня:** /прожарка, /анекдот, /совет\n"
+        "**Служебное:** /заткнись, /говори, /напоминания, /отменить, /чтознаешь, /забудь, /лохдня_тут",
+        ephemeral=True)
+
+
+@tree.command(name="анекдот", description="Рассказать анекдот")
+@app_commands.describe(тема="О чём (необязательно)")
+async def c_joke(inter: discord.Interaction, тема: str = ""):
+    await guarded(inter, say(gid(inter), {inter.user.id: inter.user.display_name},
+                             f"{inter.user.display_name} просит анекдот" + (f" про: {тема}" if тема else " на любую тему")
+                             + ". Расскажи один смешной анекдот, без вступлений."))
+
+
+@tree.command(name="совет", description="Совет от бота (полезный, но с наездом)")
+@app_commands.describe(тема="О чём совет")
+async def c_advice(inter: discord.Interaction, тема: str = ""):
+    await guarded(inter, say(gid(inter), {inter.user.id: inter.user.display_name},
+                             f"{inter.user.display_name} просит жизненный совет" + (f" про: {тема}" if тема else "")
+                             + ". Дай один реально полезный совет в своём стиле."))
+
+
+@tree.command(name="прожарка", description="Прожарить человека")
+@app_commands.describe(кого="Кого жарим")
+async def c_roast(inter: discord.Interaction, кого: discord.Member):
+    if кого.id == client.user.id:
+        await inter.response.send_message("себя я не жарю, я и так идеален. а вот ты — нет")
+        return
+    people = {кого.id: кого.display_name, inter.user.id: inter.user.display_name}
+    await guarded(inter, say(gid(inter), people,
+                             f"{inter.user.display_name} просит прожарить {кого.display_name}. Жёстко прожарь "
+                             f"{кого.display_name} в 2–4 предложениях, используя то, что о нём знаешь. "
+                             f"Обращайся к нему как <@{кого.id}>."))
+
+
+@tree.command(name="кости", description="Бросить кости, например 2d6 или 1d20+3")
+@app_commands.describe(бросок="Формат NdM+K, по умолчанию 1d6")
+async def c_dice(inter: discord.Interaction, бросок: str = "1d6"):
+    m = re.fullmatch(r"\s*(\d{0,2})\s*[dдк]\s*(\d{1,4})\s*([+-]\s*\d{1,4})?\s*", бросок.lower())
+    if not m:
+        await inter.response.send_message("пиши нормально, типа `2d6` или `1d20+3`, гений", ephemeral=True)
+        return
+    n, sides = int(m.group(1) or 1), int(m.group(2))
+    mod = int(m.group(3).replace(" ", "")) if m.group(3) else 0
+    if not (1 <= n <= 50 and 2 <= sides <= 1000):
+        await inter.response.send_message("до 50 кубиков и от 2 до 1000 граней, не наглей", ephemeral=True)
+        return
+    rolls = [random.randint(1, sides) for _ in range(n)]
+    total = sum(rolls) + mod
+    jab = ""
+    if n == 1 and sides == 20:
+        jab = " — крит, офигеть 🔥" if rolls[0] == 20 else " — крит провал, как и вся твоя жизнь 💀" if rolls[0] == 1 else ""
+    detail = f" ({' + '.join(map(str, rolls))}{f' {mod:+d}' if mod else ''})" if n > 1 or mod else ""
+    await inter.response.send_message(f"🎲 {inter.user.mention} выкинул **{total}**{detail}{jab}")
+
+
+BALL = ["бесспорно", "предрешено", "никаких сомнений", "определённо да", "можешь быть уверен в этом",
+        "мне кажется — да", "вероятнее всего", "хорошие перспективы", "знаки говорят — да", "да",
+        "пока не ясно, попробуй снова", "спроси позже", "лучше не рассказывать", "сейчас нельзя предсказать",
+        "сконцентрируйся и спроси опять", "даже не думай", "мой ответ — нет", "по моим данным — нет",
+        "перспективы не очень хорошие", "весьма сомнительно"]
+
+
+@tree.command(name="шар", description="Магический шар ответит на вопрос")
+@app_commands.describe(вопрос="Вопрос да/нет")
+async def c_ball(inter: discord.Interaction, вопрос: str):
+    await guarded(inter, _ball(inter, вопрос, random.choice(BALL)))
+
+
+async def _ball(inter, q, base):
+    comment = await say(gid(inter), {inter.user.id: inter.user.display_name},
+                        f"{inter.user.display_name} спросил магический шар: «{q}». Шар ответил: «{base}». "
+                        "Добавь одну короткую едкую фразу-комментарий (не меняя ответ шара).", max_tokens=150)
+    return f"🎱 **{q}**\nшар: **{base}**\n{comment}"
+
+
+@tree.command(name="рулетка", description="Русская рулетка: 1 из 6")
+@app_commands.guild_only()
+async def c_roulette(inter: discord.Interaction):
+    g, u = inter.guild.id, inter.user.id
+    if random.randint(1, 6) == 1:
+        streak = store.score(g, u, "roulette_streak")
+        store.set_score(g, u, "roulette_streak", 0)
+        store.add_score(g, u, "roulette_dead")
+        text = random.choice(["💥 БАХ. мозги на стене, хотя их там было немного",
+                              "💥 БАХ. земля тебе стекловатой", "💥 БАХ. ну и кто теперь лох",
+                              "💥 БАХ. респаун через минуту, нуб"])
+        if streak:
+            text += f" (продержался {streak} раз подряд)"
+        if ROULETTE_TIMEOUT and isinstance(inter.user, discord.Member):
+            try:
+                await inter.user.timeout(timedelta(seconds=ROULETTE_TIMEOUT), reason="русская рулетка")
+                text += f"\n🔇 мут на {ROULETTE_TIMEOUT} сек, полежи"
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        await inter.response.send_message(f"{inter.user.mention} {text}")
+    else:
+        store.add_score(g, u, "roulette_streak")
+        streak = store.score(g, u, "roulette_streak")
+        if streak > store.score(g, u, "roulette_best"):
+            store.set_score(g, u, "roulette_best", streak)
+        await inter.response.send_message(
+            f"🔫 *щёлк*… {inter.user.mention} живой, серия: **{streak}**. " +
+            random.choice(["везёт дуракам", "в следующий раз точно", "барабан тебя пожалел", "крути ещё, ссыкло?"]))
+
+
+@tree.command(name="дуэль", description="Вызвать человека на дуэль")
+@app_commands.describe(соперник="С кем драться")
+@app_commands.guild_only()
+async def c_duel(inter: discord.Interaction, соперник: discord.Member):
+    a, b = inter.user, соперник
+    if a.id == b.id:
+        await inter.response.send_message("сам с собой? иди лучше подрочи, тоже соло-активность")
+        return
+    winner = client.user if b.id == client.user.id else random.choice([a, b])
+    loser = a if winner.id != a.id else b
+    people = {a.id: a.display_name}
+    if b.id != client.user.id:
+        people[b.id] = b.display_name
+    await guarded(inter, _duel(inter, a, b, winner, loser, people))
+
+
+async def _duel(inter, a, b, winner, loser, people):
+    g = inter.guild.id
+    weapons = ["тапки", "мемы", "клавиатуры", "сковородки", "рейд-боссы", "аргументы из твиттера", "пиво", "кринж", "мечи"]
+    story = await say(g, people,
+                      f"Опиши дуэль {a.display_name} против {b.display_name} в 3–5 коротких строках, жёстко и смешно, "
+                      f"оружие: {random.choice(weapons)}. Победит {winner.display_name}, проиграет {loser.display_name} — "
+                      "унизительно. Используй то, что о них знаешь. Без заголовка, без итоговой строки.", max_tokens=400)
+    if winner.id != client.user.id:
+        store.add_score(g, winner.id, "duel_win")
+    if loser.id != client.user.id:
+        store.add_score(g, loser.id, "duel_loss")
+    return f"⚔️ **{a.display_name}** vs **{b.display_name}**\n{story}\n🏆 победитель: {winner.mention}"
+
+
+@tree.command(name="викторина", description="Вопрос викторины: кто первый ответит в чат")
+@app_commands.describe(тема="Тема (необязательно)")
+@app_commands.guild_only()
+async def c_quiz(inter: discord.Interaction, тема: str = ""):
+    if inter.channel.id in quizzes:
+        await inter.response.send_message("викторина уже идёт, глаза разуй", ephemeral=True)
+        return
+    await inter.response.defer(thinking=True)
+    themes = "игры, кино, сериалы, музыка, наука, история, география, мемы, интернет, еда, спорт, Warcraft, Властелин колец"
+    try:
+        m = await brain.complete([
+            {"role": "system", "content": "Ты ведущий викторины. Отвечай только JSON."},
+            {"role": "user", "content": f"Придумай один вопрос викторины средней сложности на тему: {тема or 'любая из: ' + themes}. "
+             "Ответ — 1–3 слова, однозначный, проверяемый. JSON: {\"question\": \"...\", \"answers\": [\"основной ответ\", "
+             "\"другие допустимые написания\"]}. Вопрос по-русски."}],
+            json_mode=True, temperature=1.0, max_tokens=300)
+        data = json.loads(m.get("content") or "{}")
+        question, answers = data["question"], [str(a) for a in data["answers"] if str(a).strip()]
+        assert answers
+    except RateLimited:
+        await inter.followup.send(TIRED)
+        return
+    except Exception:
+        log.exception("викторина")
+        await inter.followup.send("вопрос не придумался, мозг перегрелся. ещё раз")
+        return
+    ch = inter.channel
+    quizzes[ch.id] = {"answers": answers, "question": question, "timer": asyncio.create_task(_quiz_timeout(ch, question))}
+    await inter.followup.send(f"❓ **викторина** ({QUIZ_SECONDS} сек, пишите ответ в чат)\n{question}")
+
+
+async def _quiz_timeout(ch, question):
+    await asyncio.sleep(QUIZ_SECONDS)
+    q = quizzes.get(ch.id)
+    if q and q["question"] == question:
+        quizzes.pop(ch.id, None)
+        await ch.send(f"⌛ время вышло. ответ — **{q['answers'][0]}**. "
+                      + random.choice(["стадо баранов", "позорище", "ни одного мозга на сервер", "я в вас разочарован"]))
+
+
+@tree.command(name="очки", description="Таблица лидеров")
+@app_commands.guild_only()
+async def c_scores(inter: discord.Interaction):
+    g = inter.guild.id
+
+    def block(title, kind, unit=""):
+        rows = store.top(g, kind, 5)
+        if not rows:
+            return f"**{title}:** пусто"
+        return f"**{title}:**\n" + "\n".join(f"{i + 1}. <@{r[0]}> — {r[1]}{unit}" for i, r in enumerate(rows))
+
+    text = "\n\n".join([block("🧠 викторина", "quiz"), block("⚔️ победы в дуэлях", "duel_win"),
+                        block("🔫 рекорд рулетки", "roulette_best", " подряд"), block("🏆 лох дня", "loh", " раз")])
+    await inter.response.send_message(text, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="лохдня", description="Кто сегодня лох дня")
+@app_commands.guild_only()
+async def c_loh(inter: discord.Interaction):
+    g = inter.guild.id
+    if store.get(g, "loh_date") == datetime.now(TZ).date().isoformat():
+        uid = int(store.get(g, "loh_user"))
+        await inter.response.send_message(
+            f"сегодняшний лох уже выбран — <@{uid}>. всего лохом дня был {store.score(g, uid, 'loh')} раз",
+            allowed_mentions=discord.AllowedMentions.none())
+        return
+    await inter.response.defer(thinking=True)
+    text = await do_loh(inter.guild)
+    await inter.followup.send(text or "некого выбирать, вы все молчите", allowed_mentions=MENTIONS)
+
+
+@tree.command(name="лохдня_тут", description="Объявлять лоха дня в этом канале")
+@app_commands.guild_only()
+async def c_loh_here(inter: discord.Interaction):
+    store.put(inter.guild.id, "loh_channel", inter.channel.id)
+    await inter.response.send_message(f"ок, лоха дня объявляю здесь, каждый день в {LOH_HOUR}:00")
+
+
+@tree.command(name="заткнись", description="Бот перестанет сам влезать в этот канал")
+@app_commands.describe(минуты="На сколько минут (по умолчанию 60)")
+async def c_shut(inter: discord.Interaction, минуты: int = 60):
+    минуты = max(1, min(минуты, 24 * 60))
+    muted_until[inter.channel.id] = time.time() + минуты * 60
+    await inter.response.send_message(f"ладно, молчу {минуты} мин. но если позовёшь — отвечу, я ж не гордый 🙄")
+
+
+@tree.command(name="говори", description="Снова можно влезать в разговор")
+async def c_talk(inter: discord.Interaction):
+    muted_until.pop(inter.channel.id, None)
+    await inter.response.send_message("я вернулся, лохи 😈")
+
+
+@tree.command(name="напоминания", description="Мои напоминания")
+async def c_rem(inter: discord.Interaction):
+    rows = store.user_reminders(inter.user.id)
+    if not rows:
+        await inter.response.send_message("напоминаний нет. попроси: «поскинсон, напомни через час…»", ephemeral=True)
+        return
+    await inter.response.send_message(
+        "\n".join(f"#{r['id']} — {datetime.fromtimestamp(r['due'], TZ):%d.%m %H:%M}: {r['text']}" for r in rows), ephemeral=True)
+
+
+@tree.command(name="отменить", description="Отменить напоминание по номеру")
+@app_commands.describe(номер="Номер из /напоминания")
+async def c_cancel(inter: discord.Interaction, номер: int):
+    ok = store.close_reminder(номер, inter.user.id)
+    await inter.response.send_message("отменил" if ok else "нет у тебя такого напоминания", ephemeral=True)
+
+
+@tree.command(name="чтознаешь", description="Что бот помнит о тебе")
+async def c_know(inter: discord.Interaction):
+    await inter.response.send_message(what_i_know(inter.user.id)[:1990], ephemeral=True)
+
+
+@tree.command(name="забудь", description="Стереть, что бот о тебе помнит")
+async def c_forget(inter: discord.Interaction):
+    await inter.response.send_message(forget_text(inter.user.id), ephemeral=True)
+
+
+# ======================= лох дня =======================
+def loh_channel(guild):
+    for cid in (store.get(guild.id, "loh_channel"), last_channel.get(guild.id)):
+        ch = guild.get_channel(int(cid)) if cid else None
+        if ch and ch.permissions_for(guild.me).send_messages:
+            return ch
+    ch = guild.system_channel
+    if ch and ch.permissions_for(guild.me).send_messages:
+        return ch
+    return next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+
+
+async def do_loh(guild):
+    g = guild.id
+    cands = [(u, n) for u, n in store.active_users(g) if u != client.user.id]
+    prev = store.get(g, "loh_user")
+    if len(cands) > 1 and prev:
+        cands = [c for c in cands if str(c[0]) != prev] or cands
+    if not cands:
+        return None
+    uid, name = random.choice(cands)
+    store.put(g, "loh_date", datetime.now(TZ).date().isoformat())
+    store.put(g, "loh_user", uid)
+    store.add_score(g, uid, "loh")
+    try:
+        roast = await say(g, {uid: name}, f"Сегодня лохом дня выбран {name}. Объясни в 2–4 предложениях, почему именно он — "
+                                          "жёстко и смешно, используя то, что о нём знаешь (если ничего — придумай повод "
+                                          "из его молчания или ника).", max_tokens=300)
+    except RateLimited:
+        roast = "почему — сам знает"
+    n = store.score(g, uid, "loh")
+    return f"🏆 **лох дня** — <@{uid}>" + (f" (уже {n}-й раз)" if n > 1 else "") + f"\n{roast}"
+
+
+@tasks.loop(minutes=1)
+async def loh_loop():
+    n = datetime.now(TZ)
+    if n.hour < LOH_HOUR:
+        return
+    for guild in client.guilds:
+        if store.get(guild.id, "loh_date") == n.date().isoformat():
+            continue
+        ch = loh_channel(guild)
+        if not ch:
+            continue
+        try:
+            text = await do_loh(guild)
+            if text:
+                await send_long(ch, text)
+        except Exception:
+            log.exception("лох дня")
+
+
+# ======================= напоминания =======================
+@tasks.loop(seconds=15)
+async def reminder_loop():
+    for r in store.due_reminders():
+        store.close_reminder(r["id"])
+        text = f"⏰ <@{r['user_id']}> напоминаю: **{r['text']}**. " + random.choice(
+            ["давай, шевели булками", "не благодари", "опять бы забыл, склеротик", "я тебе не секретарь, но ладно"])
+        try:
+            ch = client.get_channel(r["channel_id"]) or await client.fetch_channel(r["channel_id"])
+            await send_long(ch, text)
+        except Exception:
+            try:
+                user = await client.fetch_user(r["user_id"])
+                await user.send(text)
+            except Exception:
+                log.exception("напоминание #%s не доставлено", r["id"])
+
+
+# ======================= чтение истории для памяти =======================
+scan_lock = asyncio.Lock()
+
+
+async def scan_guild(guild):
+    async with scan_lock:
+        for ch in guild.text_channels:
+            perms = ch.permissions_for(guild.me)
+            if not (perms.view_channel and perms.read_message_history) or store.is_scanned(ch.id):
+                continue
+            try:
+                await scan_channel(guild, ch)
+            except Exception:
+                log.exception("чтение #%s", ch.name)
+
+
+async def scan_channel(guild, ch):
+    log.info("читаю историю #%s (%s)", ch.name, guild.name)
+    msgs = [m async for m in ch.history(limit=SCAN_LIMIT) if not m.author.bot and m.content.strip()]
+    msgs.reverse()
+    for m in msgs:
+        store.seen(guild.id, m.author.id, m.author.display_name, m.created_at.timestamp())
+    chunks, cur, size = [], [], 0
+    for m in msgs:
+        line = f"{m.author.display_name}: {m.clean_content[:400]}"
+        if size + len(line) > SCAN_CHUNK_CHARS and cur:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append((m, line))
+        size += len(line) + 1
+    if cur:
+        chunks.append(cur)
+    added = 0
+    for i, chunk in enumerate(chunks):
+        names = {}
+        for m, _ in chunk:
+            names[m.author.display_name.lower()] = m.author.id
+            names.setdefault(m.author.name.lower(), m.author.id)
+        text = "\n".join(line for _, line in chunk)
+        r = None
+        for _ in range(4):
+            try:
+                r = await brain.complete([{"role": "system", "content": SCAN_PROMPT}, {"role": "user", "content": text}],
+                                         models=SCAN_MODELS, max_tokens=1200, temperature=0.3)
+                break
+            except RateLimited:
+                await asyncio.sleep(90)
+        if r is None:
+            log.warning("#%s: кусок %d пропущен — лимит", ch.name, i)
+            continue
+        for line in (r.get("content") or "").splitlines():
+            if "|" not in line:
+                continue
+            who, fact = (s.strip() for s in line.split("|", 1))
+            who = who.strip("-•* @").lower()
+            if who == "сервер":
+                added += store.add_fact(0, "сервер", fact, guild.id)
+            elif who in names:
+                added += store.add_fact(names[who], who, fact, guild.id)
+        log.info("#%s: кусок %d/%d, новых фактов: %d", ch.name, i + 1, len(chunks), added)
+        if i + 1 < len(chunks):
+            await asyncio.sleep(SCAN_PAUSE)
+    store.mark_scanned(ch.id)
+    log.info("#%s прочитан: %d сообщений, %d новых фактов", ch.name, len(msgs), added)
+
+
+@tasks.loop(hours=1)
+async def scan_loop():
+    for guild in client.guilds:
+        await scan_guild(guild)
+
+
+# ======================= запуск =======================
+async def sync_commands(guild):
+    tree.copy_global_to(guild=guild)
+    try:
+        cmds = await tree.sync(guild=guild)
+        log.info("команды на %s: %d", guild.name, len(cmds))
+    except discord.HTTPException:
+        log.exception("не удалось зарегистрировать команды на %s", guild.name)
+
+
+@client.event
+async def on_ready():
+    log.info("вошёл как %s, серверов: %d", client.user, len(client.guilds))
+    for guild in client.guilds:
+        await sync_commands(guild)
+    for loop in (loh_loop, reminder_loop, scan_loop):
+        if not loop.is_running():
+            loop.start()
+
+
+@client.event
+async def on_guild_join(guild):
+    log.info("добавили на сервер %s", guild.name)
+    await sync_commands(guild)
+    asyncio.create_task(scan_guild(guild))
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("discord.gateway").setLevel(logging.WARNING)
+    logging.getLogger("primp").setLevel(logging.WARNING)
+    client.run(TOKEN, log_handler=None)

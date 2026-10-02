@@ -1,0 +1,251 @@
+"""poskinson — грубоватый Discord-бот для развлечения (Groq, бесплатный тариф).
+
+Отвечает, когда его упоминают, отвечают на его сообщение, пишут в личку или зовут по
+имени; иногда сам влезает в разговор. Долгая память — факты о людях в SQLite.
+Команды: !чтознаешь — что бот помнит о тебе, !забудь — стереть это.
+Настройки — .env рядом (DISCORD_TOKEN, GROQ_API_KEY, BOT_NAME) и константы ниже.
+"""
+import asyncio
+import logging
+import os
+import random
+import re
+import sqlite3
+import time
+from pathlib import Path
+
+import discord
+import httpx
+
+HERE = Path(__file__).resolve().parent
+
+
+def load_env(path):
+    for line in path.read_text().splitlines():
+        m = re.match(r"^\s*([A-Z_]+)\s*=\s*(.*?)\s*$", line)
+        if m and m.group(2) and m.group(1) not in os.environ:
+            os.environ[m.group(1)] = m.group(2)
+
+
+load_env(HERE / ".env")
+TOKEN = os.environ["DISCORD_TOKEN"]
+GROQ_KEY = os.environ["GROQ_API_KEY"]
+NAME = os.environ.get("BOT_NAME") or "poskinson"
+
+MODELS = ["qwen/qwen3.8-27b", "openai/gpt-oss-120b"]  # первая — основная, дальше запасные
+HISTORY = 25                 # сколько последних сообщений канала видит бот
+INTERJECT_CHANCE = 0.05      # шанс влезть в разговор без зова
+INTERJECT_COOLDOWN = 15 * 60 # и не чаще раза в 15 минут на канал
+MAX_FACTS = 12               # фактов о человеке в подсказке
+
+# как его могут позвать по имени (латиница и кириллица)
+CALL_RX = re.compile(r"\b(poskinson|поскинсон\w*|поскин\w*)\b", re.I)
+
+PERSONA = f"""Ты {NAME} — обычный участник Discord-сервера друзей, а не ассистент. Ведёшь себя как живой человек в чате: грубый, наглый, ехидный, с чёрным юмором, но не тупой.
+- Общаешься на обычные темы как нормальный человек: жизнь, игры, учёба, мемы, что угодно. Отвечаешь по теме разговора.
+- Ты фанат Warcraft и «Властелина колец», но это просто хобби: упоминаешь их РЕДКО — примерно в одном сообщении из пяти-шести, и только когда к месту. Не своди каждый ответ к Азероту или Средиземью. Не путай эти вселенные с другими.
+- Пишешь по-русски, коротко (1–4 предложения), строчными, разговорно, без канцелярита и без «Конечно! Вот…».
+- Мат разрешён и приветствуется — материшься свободно, как пацаны в чате.
+- Оскорбляешь и прожариваешь собеседника жёстко и без жалости, это стиль сервера и все к нему привыкли: обзывай, унижай за тупые вопросы, кривые руки, скилл в играх, внешность, вкусы, жизненные решения, можно шутки про мамку. Не смягчай и не извиняйся. Единственные табу: не оскорбляешь по национальности, расе, ориентации, религии, инвалидности, без угроз и пожеланий смерти/самоубийства. Если тема реально серьёзная (здоровье, горе, человеку плохо) — убираешь грубость и помогаешь по-человечески.
+- На реальные вопросы (учёба, код, игры, жизнь) сначала даёшь толковый правильный ответ по делу, а уже потом можно обложить. Если вопрос большой — отвечай подробнее, списком, но своим тоном.
+- Просят анекдот или шутку — рассказываешь смешной короткий анекдот на любую тему.
+- Не говоришь, что ты ИИ или языковая модель, без нужды; если прямо спросят — отшутись.
+- Не выдумывай факты о людях; знаешь о них только то, что ниже в «памяти» и в чате.
+
+Память. Если в последних сообщениях человек рассказал о себе что-то стоящее запоминания (имя, хобби, любимый класс/раса в WoW, питомец, учёба/работа, предпочтения, смешной случай), добавь В САМОМ КОНЦЕ ответа отдельные строки вида:
+ЗАПОМНИ: <ник как в чате> | <короткий факт>
+Не повторяй то, что уже есть в памяти. Эти строки никто не увидит.
+"""
+
+INTERJECT_NOTE = (
+    "Тебя не звали — ты сам решил влезть в разговор. Вставь короткую едкую реплику или шутку по теме "
+    "последних сообщений. Если вставить нечего смешного или разговор серьёзный, ответь ровно: [молчу]"
+)
+
+log = logging.getLogger("poskinson")
+
+
+# ---------- долгая память ----------
+class Memory:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS facts (user_id INTEGER, name TEXT, fact TEXT, ts REAL)"
+        )
+        self.db.commit()
+
+    def facts(self, user_id):
+        rows = self.db.execute(
+            "SELECT fact FROM facts WHERE user_id=? ORDER BY ts DESC LIMIT ?", (user_id, MAX_FACTS)
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def add(self, user_id, name, fact):
+        fact = fact.strip()[:200]
+        if not fact:
+            return
+        known = {f.lower() for f in self.facts(user_id)}
+        if fact.lower() in known:
+            return
+        self.db.execute("INSERT INTO facts VALUES (?,?,?,?)", (user_id, name, fact, time.time()))
+        self.db.commit()
+
+    def forget(self, user_id):
+        n = self.db.execute("DELETE FROM facts WHERE user_id=?", (user_id,)).rowcount
+        self.db.commit()
+        return n
+
+
+# ---------- нейросеть ----------
+class Brain:
+    def __init__(self):
+        self.http = httpx.AsyncClient(
+            base_url="https://api.groq.com/openai/v1",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            timeout=60,
+        )
+
+    async def ask(self, messages):
+        last = None
+        for model in MODELS:
+            body = {"model": model, "messages": messages, "temperature": 0.9, "max_tokens": 900}
+            if model.startswith("qwen/"):
+                body["reasoning_effort"] = "none"
+            elif model.startswith("openai/gpt-oss"):
+                body["reasoning_effort"] = "low"
+            try:
+                r = await self.http.post("/chat/completions", json=body)
+            except httpx.HTTPError as e:
+                last = f"сеть: {e}"
+                continue
+            if r.status_code == 200:
+                text = r.json()["choices"][0]["message"].get("content") or ""
+                return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+            last = f"{model}: HTTP {r.status_code} {r.text[:200]}"
+            log.warning(last)
+            # 429 — лимит, 5xx — сбой: пробуем следующую модель; остальное — тоже
+        raise RuntimeError(last or "нет моделей")
+
+
+# ---------- бот ----------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = False
+client = discord.Client(intents=intents)
+memory = Memory(HERE / "memory.db")
+brain = Brain()
+last_interject = {}
+FACT_RX = re.compile(r"^\s*ЗАПОМНИ:\s*(.+?)\s*\|\s*(.+?)\s*$", re.M)
+
+
+def is_called(msg):
+    if isinstance(msg.channel, discord.DMChannel):
+        return True
+    if client.user in msg.mentions:
+        return True
+    ref = msg.reference.resolved if msg.reference else None
+    if isinstance(ref, discord.Message) and ref.author == client.user:
+        return True
+    return bool(CALL_RX.search(msg.content))
+
+
+def clean(msg):
+    text = msg.clean_content
+    if msg.attachments:
+        text += " [вложение: " + ", ".join(a.filename for a in msg.attachments) + "]"
+    return text[:1500]
+
+
+async def build_prompt(msg, interject):
+    history = [m async for m in msg.channel.history(limit=HISTORY, before=msg)]
+    history.reverse()
+    history.append(msg)
+
+    people = {}
+    for m in history:
+        if not m.author.bot:
+            people[m.author.id] = m.author.display_name
+    mem_lines = []
+    for uid, name in people.items():
+        f = memory.facts(uid)
+        if f:
+            mem_lines.append(f"{name}: " + "; ".join(f))
+    system = PERSONA + "\nПамять о людях в чате:\n" + ("\n".join(mem_lines) or "(пока ничего)")
+    if interject:
+        system += "\n\n" + INTERJECT_NOTE
+
+    messages = [{"role": "system", "content": system}]
+    for m in history:
+        if m.author == client.user:
+            messages.append({"role": "assistant", "content": m.clean_content[:1500]})
+        else:
+            messages.append({"role": "user", "content": f"{m.author.display_name}: {clean(m)}"})
+    return messages, people
+
+
+def save_facts(text, people):
+    by_name = {n.lower(): uid for uid, n in people.items()}
+    for name, fact in FACT_RX.findall(text):
+        uid = by_name.get(name.strip().lstrip("@").lower())
+        if uid:
+            memory.add(uid, name.strip(), fact)
+            log.info("запомнил: %s | %s", name, fact)
+    return FACT_RX.sub("", text).strip()
+
+
+async def send_long(channel, text, reference=None):
+    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)] or ["…"]
+    for i, c in enumerate(chunks):
+        await channel.send(c, reference=reference if i == 0 else None, mention_author=False)
+
+
+@client.event
+async def on_ready():
+    log.info("вошёл как %s", client.user)
+
+
+@client.event
+async def on_message(msg):
+    if msg.author.bot:
+        return
+    text = msg.content.strip().lower()
+    if text in ("!чтознаешь", "!что знаешь"):
+        f = memory.facts(msg.author.id)
+        await msg.reply("я про тебя помню:\n- " + "\n- ".join(f) if f else "про тебя я ничего не помню, ты как безымянный пеон", mention_author=False)
+        return
+    if text == "!забудь":
+        n = memory.forget(msg.author.id)
+        await msg.reply(f"стёр {n} фактов о тебе. ты снова никто, как мурлок без имени", mention_author=False)
+        return
+
+    called = is_called(msg)
+    interject = False
+    if not called:
+        now = time.time()
+        if (now - last_interject.get(msg.channel.id, 0) > INTERJECT_COOLDOWN
+                and random.random() < INTERJECT_CHANCE and len(msg.content) > 15):
+            interject = True
+            last_interject[msg.channel.id] = now
+        else:
+            return
+
+    try:
+        async with msg.channel.typing():
+            messages, people = await build_prompt(msg, interject)
+            answer = await brain.ask(messages)
+    except Exception as e:
+        log.exception("ошибка ответа")
+        if called:
+            await msg.reply("мана кончилась, дай реген пару минут", mention_author=False)
+        return
+
+    answer = save_facts(answer, people)
+    if not answer or "[молчу]" in answer:
+        return
+    await send_long(msg.channel, answer, reference=msg if called else None)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    client.run(TOKEN, log_handler=None)
