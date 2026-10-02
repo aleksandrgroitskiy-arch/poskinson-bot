@@ -173,6 +173,23 @@ EMOJI_RX = re.compile(r"(?<![<\w]):([\wА-Яа-яЁё]{2,32}):(?!\d)")
 PART_RX = re.compile(r"\n?\s*^-{3,}\s*$\s*\n?", re.M)
 
 
+def humanize(text):
+    """Модели пишут слишком литературно: точка в конце, Заглавная буква, «ёлочки» и длинные тире.
+    Списки, код и ссылки не трогаем."""
+    if "```" in text or re.search(r"^\s*(?:[-•*]|\d+[.)])\s", text, re.M):
+        return text
+    text = text.replace("«", "").replace("»", "").replace(" — ", " - ").replace("—", "-")
+    lines = []
+    for ln in text.split("\n"):
+        ln = ln.rstrip()
+        if ln.endswith(".") and not ln.endswith("..") and not re.search(r"https?://\S+$", ln):
+            ln = ln[:-1]
+        if len(ln) > 1 and ln[0].isupper() and not ln[1].isupper():
+            ln = ln[0].lower() + ln[1:]
+        lines.append(ln)
+    return "\n".join(lines)
+
+
 async def send_reply(channel, text, reference=None, started=None, files=(), gif=None):
     """Как человек: пауза «на печать», ответ может быть несколькими сообщениями,
     эмодзи :имя: → эмодзи сервера, [стикер: имя] → стикер, картинки и гифка — следом."""
@@ -190,7 +207,7 @@ async def send_reply(channel, text, reference=None, started=None, files=(), gif=
         emap = {}
     # эмодзи сервера → настоящие, выдуманные (:смех:) → вон
     text = EMOJI_RX.sub(lambda x: emap.get(x.group(1), ""), text).strip()
-    parts = [p.strip() for p in PART_RX.split(text) if p.strip()]
+    parts = [humanize(p.strip()) for p in PART_RX.split(text) if p.strip()]
     if len(parts) > 1 and random.random() > SPLIT_CHANCE:
         parts = ["\n".join(parts)]               # модели злоупотребляют «---»: чаще — одним сообщением
     if len(parts) > MAX_PARTS:
