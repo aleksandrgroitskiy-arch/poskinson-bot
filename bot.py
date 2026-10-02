@@ -1254,10 +1254,21 @@ async def scan_loop():
 
 
 # ======================= запуск =======================
-async def sync_commands(guild):
+def commands_hash():
+    import hashlib
+    sig = json.dumps([c.to_dict(tree) for c in tree.get_commands()], sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(sig.encode()).hexdigest()
+
+
+async def sync_commands(guild, force=False):
+    """Регистрировать команды, только если их набор поменялся: у Discord строгий лимит на это."""
+    h = commands_hash()
+    if not force and store.get(guild.id, "commands_hash") == h:
+        return
     tree.copy_global_to(guild=guild)
     try:
         cmds = await tree.sync(guild=guild)
+        store.put(guild.id, "commands_hash", h)
         log.info("команды на %s: %d", guild.name, len(cmds))
     except discord.HTTPException:
         log.exception("не удалось зарегистрировать команды на %s", guild.name)
@@ -1267,7 +1278,7 @@ async def sync_commands(guild):
 async def on_ready():
     log.info("вошёл как %s, серверов: %d", client.user, len(client.guilds))
     for guild in client.guilds:
-        await sync_commands(guild)
+        asyncio.create_task(sync_commands(guild))     # в фоне: если Discord притормозит, остальное не ждёт
     if not getattr(client, "_booted", False):
         client._booted = True
         log.info("poskinson %s", VERSION)
