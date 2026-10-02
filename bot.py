@@ -617,9 +617,54 @@ def forget_text(uid):
 
 
 # ======================= slash-команды =======================
+SPELL_TRAIL = ["✦", "✧", "⋆", "˚", "✨", "💫", "⋆", "✧"]
+SPELL_WAND = ["🔮", "🪄", "🔮", "✨"]
+
+
+def spell_frame(i):
+    left = "".join(SPELL_TRAIL[(i + k) % len(SPELL_TRAIL)] for k in range(3))
+    right = "".join(SPELL_TRAIL[(i + 4 + k) % len(SPELL_TRAIL)] for k in range(3))
+    return f"{SPELL_WAND[i % len(SPELL_WAND)]} {left} *кастует заклинание* {right}"
+
+
+class Spell:
+    """Вместо Discord-овского «poskinson думает…»: своё сообщение с переливающимися искрами,
+    которое по готовности превращается в ответ."""
+
+    def __init__(self, inter):
+        self.inter = inter
+        self.task = None
+
+    async def start(self, ephemeral=False):
+        await self.inter.response.send_message(spell_frame(0), ephemeral=ephemeral)
+        self.task = asyncio.create_task(self._animate())
+        return self
+
+    async def _animate(self):
+        i = 1
+        try:
+            while i < 40:                       # не дольше ~50 с, дальше просто висит последний кадр
+                await asyncio.sleep(1.2)
+                await self.inter.edit_original_response(content=spell_frame(i))
+                i += 1
+        except (asyncio.CancelledError, discord.HTTPException):
+            pass
+
+    async def done(self, content=None, file=None, mentions=MENTIONS):
+        if self.task:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)   # кадр не перезапишет готовый ответ
+        kw = {"attachments": [file]} if file else {}
+        await self.inter.edit_original_response(content=(content or "…")[:1990], allowed_mentions=mentions, **kw)
+
+
+async def cast(inter, ephemeral=False):
+    return await Spell(inter).start(ephemeral)
+
+
 async def guarded(inter, coro):
-    """Отложенный ответ: нейросеть думает дольше трёх секунд."""
-    await inter.response.defer(thinking=True)
+    """Ответ нейросети в команде: пока думает — «кастует заклинание»."""
+    spell = await cast(inter)
     try:
         text = await coro
     except RateLimited:
@@ -627,7 +672,7 @@ async def guarded(inter, coro):
     except Exception:
         log.exception("команда")
         text = "чёт сломалось, попробуй позже"
-    await inter.followup.send((text or "…")[:1990], allowed_mentions=MENTIONS)
+    await spell.done(text)
 
 
 def gid(inter):
@@ -683,7 +728,7 @@ async def c_draw(inter: discord.Interaction, что: str):
     if not image_ok(inter.user.id):
         await inter.response.send_message(f"не больше {IMAGES_PER_USER_HOUR} картинок в час, художник хуев", ephemeral=True)
         return
-    await inter.response.defer(thinking=True)
+    spell = await cast(inter)
     try:
         m = await router.complete([{"role": "user", "content": "Переведи на английский и подробно опиши для генератора "
                                     f"картинок (объект, стиль, детали, 1–2 предложения), только описание: {что}"}],
@@ -692,16 +737,16 @@ async def c_draw(inter: discord.Interaction, что: str):
         try:
             data, name, src = await media.generate(prompt, nsfw=is_nsfw(inter.channel))
         except ValueError:
-            await inter.followup.send("такое рисую только в 18+ канале и только со взрослыми" if not is_nsfw(inter.channel)
-                                      else "с несовершеннолетними — никогда. иди нахуй")
+            await spell.done("такое рисую только в 18+ канале и только со взрослыми" if not is_nsfw(inter.channel)
+                             else "с несовершеннолетними — никогда. иди нахуй")
             return
         comment = await say(gid(inter), {inter.user.id: inter.user.display_name},
                             f"{inter.user.display_name} попросил нарисовать: «{что}». Картинка готова. "
                             "Одной короткой едкой фразой прокомментируй его запрос.", max_tokens=120)
-        await inter.followup.send(comment[:1900] or "на, любуйся", file=discord.File(io.BytesIO(data), filename=name))
+        await spell.done(comment[:1900] or "на, любуйся", file=discord.File(io.BytesIO(data), filename=name))
     except Exception:
         log.exception("нарисуй")
-        await inter.followup.send("кисточка сломалась, попробуй позже")
+        await spell.done("кисточка сломалась, попробуй позже")
 
 
 @tree.command(name="статистика", description="Расход нейросетей за сегодня (для админов)")
@@ -897,7 +942,7 @@ async def c_quiz(inter: discord.Interaction, тема: str = ""):
     if inter.channel.id in quizzes:
         await inter.response.send_message("викторина уже идёт, глаза разуй", ephemeral=True)
         return
-    await inter.response.defer(thinking=True)
+    spell = await cast(inter)
     themes = "игры, кино, сериалы, музыка, наука, история, география, мемы, интернет, еда, спорт, техника"
     try:
         m = await brain.complete([
@@ -910,15 +955,15 @@ async def c_quiz(inter: discord.Interaction, тема: str = ""):
         question, answers = data["question"], [str(a) for a in data["answers"] if str(a).strip()]
         assert answers
     except RateLimited:
-        await inter.followup.send(TIRED)
+        await spell.done(TIRED)
         return
     except Exception:
         log.exception("викторина")
-        await inter.followup.send("вопрос не придумался, мозг перегрелся. ещё раз")
+        await spell.done("вопрос не придумался, мозг перегрелся. ещё раз")
         return
     ch = inter.channel
     quizzes[ch.id] = {"answers": answers, "question": question, "timer": asyncio.create_task(_quiz_timeout(ch, question))}
-    await inter.followup.send(f"❓ **викторина** ({QUIZ_SECONDS} сек, пишите ответ в чат)\n{question}")
+    await spell.done(f"❓ **викторина** ({QUIZ_SECONDS} сек, пишите ответ в чат)\n{question}")
 
 
 async def _quiz_timeout(ch, question):
@@ -956,9 +1001,9 @@ async def c_loh(inter: discord.Interaction):
             f"сегодняшний лох уже выбран — <@{uid}>. всего лохом дня был {store.score(g, uid, 'loh')} раз",
             allowed_mentions=discord.AllowedMentions.none())
         return
-    await inter.response.defer(thinking=True)
+    spell = await cast(inter)
     text = await do_loh(inter.guild)
-    await inter.followup.send(text or "некого выбирать, вы все молчите", allowed_mentions=MENTIONS)
+    await spell.done(text or "некого выбирать, вы все молчите")
 
 
 @tree.command(name="лохдня_тут", description="Объявлять лоха дня в этом канале (для админов)")
@@ -973,11 +1018,11 @@ async def c_loh_here(inter: discord.Interaction):
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 async def c_kb(inter: discord.Interaction):
-    await inter.response.defer(thinking=True, ephemeral=True)
+    spell = await cast(inter, ephemeral=True)
     ok = await build_guild_kb(inter.guild)
     kb, _ = memory.kb(inter.guild.id)
-    await inter.followup.send(("✅ база знаний собрана:\n" if ok else "✕ не получилось (лимит или нет инфо-каналов), текущая:\n")
-                              + (kb or "(пусто)")[:1800], ephemeral=True)
+    await spell.done(("✅ база знаний собрана:\n" if ok else "✕ не получилось (лимит или нет инфо-каналов), текущая:\n")
+                     + (kb or "(пусто)")[:1800])
 
 
 @tree.command(name="заткнись", description="Бот перестанет сам влезать в этот канал")
