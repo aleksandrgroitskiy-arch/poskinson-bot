@@ -16,10 +16,13 @@ DESCRIBE_PROMPT = ("Опиши картинку по-русски для уча�
                    "настроение, если это мем — в чём шутка, весь текст на картинке дословно. 2–5 предложений, без вступлений.")
 
 
-# бот на публичном сервере: откровенное, дети в сомнительном контексте, жесть — не рисуем
-NSFW = re.compile(r"\b(nude|naked|nsfw|porn|sex|sexual|erotic|hentai|genital|nipple|boob|breast|lingerie|undress|"
-                  r"gore|dismember|decapitat|beheading|torture|suicide|self-harm|child|kid|minor|loli|shota|teen)\w*|"
-                  r"гол(ая|ый|ые)|порно|секс|эроти|хентай|расчлен|суицид", re.I)
+# не рисуем только откровенное 18+ (и любые сексуальные сюжеты с несовершеннолетними); жестокость, кровь, хоррор — можно
+SEXUAL = re.compile(r"\b(nude|naked|nsfw|porn|sex|sexual|erotic|hentai|genital|nipple|boobs?|lingerie|undress|topless|"
+                    r"orgasm|fetish|bdsm)\w*|гол(ая|ый|ые)|голышом|порно|секс|эроти|хентай|сиськ|обнажён", re.I)
+
+
+def forbidden(prompt):
+    return bool(SEXUAL.search(prompt)) or bool(re.search(r"\b(loli|shota)\b", prompt, re.I))
 
 
 class Media:
@@ -67,7 +70,7 @@ class Media:
     # ---------- текст → картинка ----------
     async def generate(self, prompt):
         """prompt по-английски. Возвращает (bytes, имя файла, источник)."""
-        if NSFW.search(prompt):
+        if forbidden(prompt):
             raise ValueError("такое не рисую")
         if CF_ACCOUNT and CF_TOKEN:
             try:
