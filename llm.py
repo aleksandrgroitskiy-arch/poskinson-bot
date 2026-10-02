@@ -39,6 +39,8 @@ class Router:
     async def discover(self):
         """Прочитать каталоги моделей: чего нет — не предлагать."""
         for name, c in self.clients.items():
+            if PROVIDERS[name].get("no_catalog"):
+                continue                       # каталог по этому адресу не отдаётся — верим списку из config
             try:
                 r = await c.get("/models")
                 if r.status_code == 200:
@@ -143,6 +145,13 @@ class Router:
                 if tools is None and not (msg.get("content") or "").strip():
                     last = f"{p}:{m} пустой ответ"
                     continue
+                if tools and not msg.get("tool_calls"):
+                    parsed = _text_tool_calls(msg.get("content") or "", tools)
+                    if parsed:
+                        # модель написала вызов инструмента текстом (JSON) — превращаем в настоящий
+                        msg["tool_calls"], msg["content"] = parsed, ""
+                        log.info("%s:%s вызвал инструмент текстом — разобрал: %s", p, m,
+                                 ", ".join(c["function"]["name"] for c in parsed))
                 if re.search(r"<tool_call>|<function=|<\|tool", msg.get("content") or ""):
                     # провайдер сломал вызов инструментов и отдал его текстом — не позоримся, следующая модель
                     last = f"{p}:{m} инструмент текстом"
@@ -199,3 +208,28 @@ def _seconds(v):
     for num, unit in re.findall(r"([\d.]+)(ms|h|m|s)", v or ""):
         total += float(num) * {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[unit]
     return total or 60.0
+
+
+def _text_tool_calls(text, tools):
+    """[{"name": "set_reminder", "arguments": {...}}] или {"name": …, "parameters": …} текстом → tool_calls."""
+    names = {t["function"]["name"] for t in tools}
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
+    if not (t.startswith("{") or t.startswith("[")):
+        m = re.search(r"(\[\s*\{\s*\"name\".*\}\s*\]|\{\s*\"name\".*\})", t, re.S)
+        if not m:
+            return None
+        t = m.group(1)
+    try:
+        data = json.loads(t)
+    except ValueError:
+        return None
+    items = data if isinstance(data, list) else [data]
+    calls = []
+    for i, it in enumerate(items):
+        if not isinstance(it, dict) or it.get("name") not in names:
+            return None
+        args = it.get("arguments", it.get("parameters", {}))
+        calls.append({"id": f"text_call_{i}", "type": "function",
+                      "function": {"name": it["name"], "arguments": args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)}})
+    return calls or None

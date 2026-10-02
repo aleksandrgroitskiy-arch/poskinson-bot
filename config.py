@@ -17,7 +17,7 @@ def _load_env(path):
 
 
 _load_env(HERE / ".env")
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 TOKEN = os.environ["DISCORD_TOKEN"]
 NAME = os.environ.get("BOT_NAME") or "poskinson"
 TZ = ZoneInfo("Europe/Moscow")
@@ -36,6 +36,15 @@ PROVIDERS = {
     "groq": {"base": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY"},
     "cerebras": {"base": "https://api.cerebras.ai/v1", "key": "CEREBRAS_API_KEY"},
     "nvidia": {"base": "https://integrate.api.nvidia.com/v1", "key": "NVIDIA_API_KEY"},
+    # Cloudflare Workers AI: бесплатно 10 000 «нейронов» в сутки; Kimi/DeepSeek/GLM — только на платном тарифе
+    "cloudflare": {"base": f"https://api.cloudflare.com/client/v4/accounts/{key('CLOUDFLARE_ACCOUNT_ID')}/ai/v1",
+                   "key": "CLOUDFLARE_API_TOKEN", "no_catalog": True},
+    # Z.ai: GLM-Flash бесплатно, без карты; один запрос за раз
+    "zai": {"base": "https://api.z.ai/api/paas/v4", "key": "ZAI_API_KEY"},
+    # SambaNova: бесплатно, пока не привязан способ оплаты
+    "sambanova": {"base": "https://api.sambanova.ai/v1", "key": "SAMBANOVA_API_KEY"},
+    # Mistral: бесплатный тариф Experiment (нужно подтвердить телефон), ~2 запроса/мин, но много токенов в месяц
+    "mistral": {"base": "https://api.mistral.ai/v1", "key": "MISTRAL_API_KEY"},
     # GitHub Models закрыт 30.07.2026 — не подключать
     "openrouter": {"base": "https://openrouter.ai/api/v1", "key": "OPENROUTER_API_KEY", "daily": 45,
                    "headers": {"HTTP-Referer": "https://discord.com", "X-Title": "poskinson"}},
@@ -48,36 +57,53 @@ PROVIDERS = {
 MODELS = {
     "chat": [
         ("groq", "qwen/qwen3.8-27b"),
+        ("sambanova", "DeepSeek-V3.1"),
+        ("cloudflare", "@cf/qwen/qwen3.8-27b"),
+        ("zai", "glm-4.7-flash"),
+        ("sambanova", "DeepSeek-V3.2"),
+        ("mistral", "mistral-medium-latest"),
         ("nvidia", "moonshotai/kimi-k2.6"),
         ("nvidia", "deepseek-ai/deepseek-v4.1-flash"),
         ("nvidia", "z-ai/glm-5.3"),
         ("cerebras", "gpt-oss-120b"),
         ("cerebras", "qwen-3-235b-a22b-instruct-2507"),
         ("groq", "openai/gpt-oss-120b"),
+        ("cloudflare", "@cf/mistralai/mistral-small-3.1-24b-instruct"),
+        ("cloudflare", "@cf/openai/gpt-oss-120b"),
         ("groq", "openai/gpt-oss-20b"),
     ],
     "light": [
         ("groq", "openai/gpt-oss-20b"),
+        ("zai", "glm-4.5-flash"),
+        ("mistral", "mistral-small-latest"),
         ("cerebras", "gpt-oss-120b"),
         ("nvidia", "nvidia/nemotron-3.5-lightning-30b-a3b"),
         ("nvidia", "z-ai/glm-5.3-flash"),
         ("groq", "openai/gpt-oss-120b"),
+        ("cloudflare", "@cf/openai/gpt-oss-20b"),
         ("groq", "qwen/qwen3.8-27b"),
     ],
     # последний резерв, когда вся болтовня в лимите: без инструментов (у бесплатных OpenRouter они ломаются)
     "fallback": [
+        ("zai", "glm-4.7-flash"),
+        ("cloudflare", "@cf/qwen/qwen3.8-27b"),
         ("openrouter", "qwen/qwen3.8-27b:free"),
         ("openrouter", "google/gemma-4-31b-it:free"),
     ],
     # память: карточки и сводки — нужна аккуратность (маленькие модели присочиняют)
     "memory": [
+        ("sambanova", "DeepSeek-V3.1"),
+        ("mistral", "mistral-medium-latest"),
         ("cerebras", "gpt-oss-120b"),
         ("nvidia", "deepseek-ai/deepseek-v4.1-flash"),
         ("nvidia", "moonshotai/kimi-k2.6"),
         ("groq", "qwen/qwen3.8-27b"),
+        ("cloudflare", "@cf/qwen/qwen3.8-27b"),
         ("groq", "openai/gpt-oss-120b"),
     ],
     "vision": [
+        ("zai", "glm-4.6v-flash"),
+        ("cloudflare", "@cf/mistralai/mistral-small-3.1-24b-instruct"),
         ("openrouter", "google/gemma-4-31b-it:free"),
         ("nvidia", "google/gemma-4-31b-it"),
         ("openrouter", "qwen/qwen3.8-27b:free"),
