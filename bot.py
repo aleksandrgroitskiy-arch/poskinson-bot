@@ -23,7 +23,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from brain import Brain, RateLimited, fix_script
-from config import (CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
+from config import (CALL_NAMES, CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
                     JUDGE_PROMPT, JUDGE_THRESHOLD, LOG_DIR, LOH_HOUR, MAX_PARTS, NAME, PERSONA, QUIZ_SECONDS,
                     REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SPLIT_CHANCE, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
                     SUMMARY_EVERY, SUMMARY_IDLE, TOKEN, TYPING_CPS, TYPING_MAX, TZ, VERSION, DAILY_CAPS, FLOOD_PER_MIN,
@@ -48,6 +48,7 @@ brain = Brain(store, router, media)
 
 last_interject = {}     # channel_id → время последнего вмешательства
 muted_until = {}        # channel_id → до какого времени молчит сам
+talk_mode = {}          # channel_id → {last: время последнего сообщения людей, nudged: писал ли сам в тишине, msg: последнее сообщение}
 last_channel = {}       # guild_id → последний живой канал (для «лоха дня»)
 transcripts = {}        # message_id → текст голосового
 images = {}             # message_id → описание картинок
@@ -400,7 +401,7 @@ def is_newbie(member):
     return bool(joined) and (datetime.now(joined.tzinfo) - joined).days < 3
 
 
-async def build_prompt(m, interject, with_kb=False):
+async def build_prompt(m, interject, with_kb=False, note=None):
     history = [x async for x in m.channel.history(limit=HISTORY, before=m)]
     history.reverse()
     history.append(m)
@@ -419,6 +420,8 @@ async def build_prompt(m, interject, with_kb=False):
         system += NSFW_NOTE if is_nsfw(m.channel) else SFW_NOTE
     if interject:
         system += "\n\n" + INTERJECT_NOTE
+    if note:
+        system += "\n\n" + note
     # недавний чат — одним блоком (контекст), а сообщение, на которое отвечаем, — отдельно и явно:
     # так модели не путают, кому отвечать, и не отвечают на старые вопросы из истории
     lines = [f"{'ты (' + NAME + ')' if x.author == client.user else x.author.display_name}: {msg_text(x)[:220]}"
@@ -431,7 +434,7 @@ async def build_prompt(m, interject, with_kb=False):
     return msgs, people
 
 
-async def respond(m, called, interject):
+async def respond(m, called, interject, note=None):
     started = time.monotonic()
     ctx = {"channel_id": m.channel.id, "user_id": m.author.id, "guild_id": m.guild.id if m.guild else 0,
            "image_ok": image_ok, "kb": memory.kb(m.guild.id)[0] if m.guild else "",
@@ -442,7 +445,7 @@ async def respond(m, called, interject):
             ref = m.reference.resolved if m.reference else None
             if isinstance(ref, discord.Message):
                 await see_images(ref)
-            msgs, people = await build_prompt(m, interject, with_kb=bool(HELP_RX.search(m.content)) or is_newbie(m.author))
+            msgs, people = await build_prompt(m, interject, with_kb=bool(HELP_RX.search(m.content)) or is_newbie(m.author), note=note)
             answer = await brain.chat(msgs, ctx)
     except RateLimited:
         log.warning("лимит Groq")
@@ -458,7 +461,7 @@ async def respond(m, called, interject):
     if "[молчу]" in answer or (not answer and not ctx.get("files")):
         return
     log.info("ответ %s (%s) в #%s", "по зову" if called else "сам", ctx.get("model"), getattr(m.channel, "name", "лс"))
-    await send_reply(m.channel, answer, reference=m if called else None, started=started,
+    await send_reply(m.channel, answer, reference=m if called and not note else None, started=started,
                      files=ctx.get("files", ()), gif=ctx.get("gif"))
     if ctx.get("paste"):
         name, text = ctx["paste"]
@@ -532,12 +535,17 @@ async def on_message(m):
         last_activity[m.channel.id] = time.time()
         if KB_CHANNEL_RX.search(m.channel.name):
             kb_dirty.add(m.guild.id)
-    called = is_called(m)
+    if m.guild and await talk_control(m):
+        return
+    talking = bool(m.guild) and m.channel.id in talk_mode
+    called = is_called(m) or talking
     if called and flooding(m.author.id):
         log.info("антифлуд: игнор %s", m.author.display_name)
         return
     voice = is_voice(m) and await handle_voice(m)
     called = called or is_called(m)
+    if talking:
+        talk_mode[m.channel.id].update(last=time.time(), nudged=False, msg=m)
     interject = False
     if not called:
         if muted(m.channel.id):
@@ -559,7 +567,44 @@ async def on_message(m):
                 except discord.HTTPException:
                     pass
             return
-    await respond(m, called, interject)
+    await respond(m, called, interject, note=TALK_NOTE if talking else None)
+
+
+TALK_START_RX = re.compile(rf"(?<!\w){CALL_NAMES}[\s,!.:-]+(?:ну\s+|а\s+|так\s+)?(?:давай|го|пошли|может)\s+(?:уже\s+|с\s+тобой\s+|тогда\s+)?"
+                           r"(?:по(?:говорим|болтаем|общаемся|трещим|базарим|тусим|беседуем|чатимся)|потрёпемся|потрепемся|"
+                           r"(?:поболтать|поговорить|пообщаться|потрепаться|побазарить|побеседовать))", re.I)
+TALK_STOP_RX = re.compile(rf"(?<!\w)(?:{CALL_NAMES}[\s,!.:-]+(?:всё|все|ладно|ну\s+)?\s*(?:хватит|харэ|хорош|стоп|заткнись|замолчи|отстань|помолчи|умолкни|пока)"
+                          r"|(?:хватит|харэ)\s+(?:болтать|трещать|базарить|разговаривать)|давай\s+закончим)", re.I)
+TALK_IDLE = 7 * 60          # без ответов людей столько — режим сам выключается
+TALK_NUDGE = 100            # в тишине бот пишет сам один раз через столько секунд
+
+TALK_NOTE = ("РЕЖИМ БЕСЕДЫ: с тобой просто болтают по душам, и ты ведёшь разговор как живой человек, а не бот на подхвате. "
+             "2–4 фразы, характер прежний (ехидный, с матом), но ты правда интересуешься собеседником: отвечай по сути, делись "
+             "своим мнением и историями, подмечай детали из его слов и памяти о нём, а в конце чаще всего задавай свой вопрос "
+             "(не шаблонный «а ты как?», а по теме) или бросай новую тему, чтобы беседа не затухала. Не повторяй вопросы, "
+             "которые уже задавал. Если сейчас много людей — обращайся по именам и втягивай всех.")
+TALK_START_NOTE = ("\n\nСобеседник предложил поговорить: согласись в своём стиле и сам открой беседу — спроси о чём-то "
+                   "конкретном (о нём, его дне, играх, Майнкрафте, жизни), не «о чём хочешь поговорить».")
+TALK_NUDGE_NOTE = ("\n\nВ чате тишина — собеседник притих. Сам напиши что-нибудь: зацепись за прошлую тему иначе или "
+                   "брось новую, задай вопрос, можно подколоть, что заснул.")
+
+
+async def talk_control(m):
+    """Включает/выключает режим беседы в канале. True — сообщение уже обработано."""
+    ch = m.channel.id
+    text = m.content + " " + transcripts.get(m.id, "")
+    if ch in talk_mode and TALK_STOP_RX.search(text):
+        talk_mode.pop(ch, None)
+        await m.reply(random.choice(["ладно, молчу", "окей, пообщались, зови если чё", "всё, ушёл в тень", "понял, умолкаю"]),
+                      mention_author=False)
+        return True
+    if ch not in talk_mode and TALK_START_RX.search(text):
+        if flooding(m.author.id):
+            return True
+        talk_mode[ch] = {"last": time.time(), "nudged": False, "msg": m}
+        await respond(m, True, False, note=TALK_NOTE + TALK_START_NOTE)
+        return True
+    return False
 
 
 PASTE_SAVE_RX = re.compile(r"(?:запомни|сохрани|добавь|запиши)\s+(?:это\s+)?(?:как\s+)?пасту\s*(.*)", re.I | re.S)
@@ -642,6 +687,7 @@ async def c_help(inter: discord.Interaction):
         "(«поскинсон, напомни через 2 часа…»).\n"
         "**Игры:** /лохдня, /дуэль, /рулетка, /кости, /шар, /викторина, /очки\n"
         "**Болтовня:** /прожарка, /анекдот, /совет, /нарисуй\n"
+        "**Беседа:** «поскинсон давай поговорим» — болтаю сам и задаю вопросы, «поскинсон хватит» — стоп\n"
         "**Пасты:** /паста, /паста_добавить, /пасты, /паста_удалить — или ответь на сообщение «поскинсон, запомни пасту <название>»\n"
         "**Служебное:** /заткнись, /говори, /напоминания, /отменить, /чтознаешь, /забудь, /лохдня_тут, /статистика\n"
         f"версия {VERSION}",
@@ -1074,6 +1120,22 @@ async def loh_loop():
             log.exception("лох дня")
 
 
+@tasks.loop(seconds=20)
+async def talk_loop():
+    now = time.time()
+    for ch, st in list(talk_mode.items()):
+        idle = now - st["last"]
+        if idle >= TALK_IDLE:
+            talk_mode.pop(ch, None)
+            log.info("режим беседы в %s закончился по тишине", ch)
+        elif idle >= TALK_NUDGE and not st["nudged"] and not router.busy(60, 3):
+            st["nudged"] = True
+            try:
+                await respond(st["msg"], False, False, note=TALK_NOTE + TALK_NUDGE_NOTE)
+            except Exception:
+                log.exception("реплика в режиме беседы")
+
+
 # ======================= напоминания =======================
 @tasks.loop(seconds=15)
 async def reminder_loop():
@@ -1310,7 +1372,7 @@ async def on_ready():
             memory.backup()
         except Exception:
             log.exception("копия памяти")
-    for loop in (loh_loop, reminder_loop, scan_loop, summary_loop, maintenance_loop):
+    for loop in (talk_loop, loh_loop, reminder_loop, scan_loop, summary_loop, maintenance_loop):
         if not loop.is_running():
             loop.start()
 
