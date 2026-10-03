@@ -8,7 +8,7 @@ from datetime import datetime
 
 import httpx
 
-from config import REMINDERS_PER_USER, TZ
+from config import CALL_RX, REMINDERS_PER_USER, TZ
 from llm import RateLimited  # noqa: F401 — реэкспорт для bot.py
 
 log = logging.getLogger("poskinson.brain")
@@ -125,7 +125,7 @@ class Brain:
         q = ctx.get("text", "")
         if MC_HOWTO.search(q) and any(t["function"]["name"] == "web_search" for t in tools or []):
             # вопрос по механике Майнкрафта: ищем по вики сами, не надеясь, что модель захочет
-            clean_q = re.sub(r"(?i)\b(poskinson|поскинсон\w*|поскин\w*)\b[,!]?", "", q).strip()
+            clean_q = re.sub(CALL_RX.pattern + r"[,!]?", "", q, flags=re.I).strip()
             found = await self.search(clean_q + " майнкрафт site:ru.minecraft.wiki")
             if found.startswith(("ничего", "поиск не")):
                 found = await self.search(clean_q + " minecraft wiki")
