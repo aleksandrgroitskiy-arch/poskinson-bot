@@ -93,3 +93,10 @@ scp phone:~/discord-bot/memory.db ~/   # забрать память
 
 ### Вернуть бота на ПК
 На телефоне останови бота, скопируй `memory.db` на ПК в `~/Projects/discord-bot/` (так сохранится память), затем `systemctl --user start poskinson`.
+
+### Копия памяти (телефон → GitHub, зеркало на ПК)
+`memory.db` живёт на телефоне. Скрипт `tools/push-memory.sh loop` (tmux-сессия `memsync`, автозапуск в Termux:Boot)
+каждый день в 05:00 снимает консистентный снимок, проверяет его и пушит в приватный репозиторий
+`aleksandrgroitskiy-arch/poskinson-memory` через deploy key `~/.ssh/memory_deploy`. `.env` не копируется.
+Лог: `logs/push-memory.log`. Вручную: `tools/push-memory.sh` на телефоне. ПК в 06:00 забирает копию с GitHub
+(`poskinson-memory-backup`). Восстановить: остановить бота, `scp memory.db phone:discord-bot/memory.db`, запустить.

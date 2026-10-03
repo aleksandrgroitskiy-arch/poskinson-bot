@@ -6,6 +6,7 @@
 """
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -30,7 +31,10 @@ def short(p, m):
 
 def main():
     out = {"updated": time.strftime("%H:%M"), "version": config.VERSION}
-    out["active"] = subprocess.run(["systemctl", "--user", "is-active", "--quiet", "poskinson"]).returncode == 0
+    if shutil.which("systemctl"):
+        out["active"] = subprocess.run(["systemctl", "--user", "is-active", "--quiet", "poskinson"]).returncode == 0
+    else:  # Termux на телефоне: бот крутится в tmux-сессии bot
+        out["active"] = subprocess.run(["pgrep", "-f", "python bot.py"], capture_output=True).returncode == 0
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     db = sqlite3.connect(f"file:{HERE / 'memory.db'}?mode=ro", uri=True)
     rows = {}
