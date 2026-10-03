@@ -116,7 +116,7 @@ class Router:
                    + max_tokens * 0.5)
         for p, m in self.candidates(role, need):
             body = {"model": m, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-            if p == "groq":
+            if p.startswith("groq"):
                 body["reasoning_effort"] = "none" if m.startswith("qwen/") else "low"
             elif "gpt-oss" in m:
                 body["reasoning_effort"] = "low"

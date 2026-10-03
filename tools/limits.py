@@ -33,8 +33,11 @@ def main():
     out["active"] = subprocess.run(["systemctl", "--user", "is-active", "--quiet", "poskinson"]).returncode == 0
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     db = sqlite3.connect(f"file:{HERE / 'memory.db'}?mode=ro", uri=True)
-    rows = {(p, m): (req, err, ti + to) for p, m, req, err, ti, to in
-            db.execute("SELECT provider, model, requests, errors, tok_in, tok_out FROM usage WHERE day=?", (day,))}
+    rows = {}
+    for p, m, req, err, ti, to in db.execute("SELECT provider, model, requests, errors, tok_in, tok_out FROM usage WHERE day=?", (day,)):
+        p = "groq" if p == "groq2" else p          # два ключа Groq — в виджете одна строка на модель
+        a = rows.get((p, m), (0, 0, 0))
+        rows[(p, m)] = (a[0] + req, a[1] + err, a[2] + ti + to)
     models, seen = [], set()
     # сначала модели болтовни по порядку, потом всё, что сегодня тратилось
     order = [pm for pm in config.MODELS["chat"] if pm[0] == "groq"] + list(rows)
@@ -79,9 +82,11 @@ def main():
 
 def live():
     import urllib.request
-    key = config.key("GROQ_API_KEY")
     res = []
-    for m in ("qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"):
+    for n, key in enumerate((config.key("GROQ_API_KEY"), config.key("GROQ_API_KEY_2")), 1):
+      if not key:
+        continue
+      for m in ("qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"):
         body = json.dumps({"model": m, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode()
         req = urllib.request.Request("https://api.groq.com/openai/v1/chat/completions", body,
                                      {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
