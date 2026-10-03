@@ -38,9 +38,11 @@ pkg install python git tmux unzip
 cd ~
 unzip ~/storage/downloads/poskinson-phone.zip
 cd discord-bot
-pip install discord.py==2.7.1 httpx==0.28.1
+pip install discord.py==2.7.1 httpx==0.28.1 tzdata
 ```
 Если `pip` ругается на сборку `aiohttp`, `multidict` или `yarl`, сделай `pkg install clang make libffi openssl` и повтори.
+
+`tzdata` нужен, потому что в Termux нет системной базы часовых поясов, без него `zoneinfo` падает при старте.
 
 `ddgs` (веб-поиск) на Termux ставить **не нужно**: он тянет тяжёлые зависимости. Без него только не работает инструмент поиска, а остальное живёт, ошибка в боте перехватывается.
 

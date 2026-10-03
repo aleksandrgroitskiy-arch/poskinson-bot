@@ -82,8 +82,26 @@ MC_HOWTO = re.compile(r"крафт|рецепт|ферм|редстоун|мех
                       r"житель|торгов|голем|иссушител|дракон|вард(?:ен)?|шалкер|трезубец", re.I)
 
 
-def pick_tools(text):
+# вопросы про вещи из мира (кино, аниме, игры, музыка, люди, места): память модели врёт — сначала поиск в сети
+FACT_RX = re.compile(r"аниме|манг[аиу]|сериал|фильм|кино|мульт|игр[аыуе]|игру|книг|песн|трек|альбом|групп[аыу]|исполнител|"
+                     r"режисс|актёр|актер|персонаж|герой|сезон|серия|серии|эпизод|студи[яи]|разработчик|"
+                     r"знаешь|слышал|смотрел|играл|читал|что за|кто так(?:ой|ая|ие)|что так(?:ое|ой)|про что|о чём|о чем|"
+                     r"расскажи|объясни|правда что|правда ли|скольк|в каком году|когда вышел|откуда|кто создал|кто сделал", re.I)
+NAMED_RX = re.compile(r"[«\"“][^»\"”]{2,60}[»\"”]|(?<=[a-zа-яё,] )[A-ZА-ЯЁ][\w'-]{2,}|\b[A-Za-z][A-Za-z0-9'-]{3,}\b")
+
+
+def needs_facts(text, talk=False):
+    """Нужно ли проверить факты в сети до ответа (есть вопрос про конкретную вещь, а не просто болтовня)."""
+    text = text or ""
+    if FACT_RX.search(text):
+        return True
+    return talk and bool(NAMED_RX.search(text))
+
+
+def pick_tools(text, talk=False):
     names = set()
+    if needs_facts(text, talk):
+        names |= {"web_search", "open_page"}
     for group, rx in INTENTS:
         if rx.search(text or ""):
             names |= group
@@ -120,7 +138,7 @@ class Brain:
 
     async def _chat(self, messages, ctx):
         msgs = list(messages)
-        tools = pick_tools(ctx.get("text", "")) if "text" in ctx else TOOLS
+        tools = pick_tools(ctx.get("text", ""), ctx.get("talk")) if "text" in ctx else TOOLS
         force = False
         q = ctx.get("text", "")
         if MC_HOWTO.search(q) and any(t["function"]["name"] == "web_search" for t in tools or []):
@@ -132,6 +150,15 @@ class Brain:
             log.info("поиск по вики заранее: %s → %s", clean_q[:60], found[:80].replace("\n", " "))
             msgs.insert(-1, {"role": "system", "content": "Найдено в вики по этому вопросу (отвечай строго по этому, "
                              "своими словами; если тут нет ответа — так и скажи или поищи ещё):\n" + found[:2000]})
+        elif needs_facts(q, ctx.get("talk")) and any(t["function"]["name"] == "web_search" for t in tools or []):
+            # вопрос про конкретную вещь (аниме, сериал, игра, человек…): сначала сверяемся с сетью, а не с памятью модели
+            clean_q = re.sub(CALL_RX.pattern + r"[,!]?", "", q, flags=re.I).strip()[:200]
+            found = await self.search(clean_q)
+            log.info("проверка фактов заранее: %s → %s", clean_q[:60], found[:80].replace("\n", " "))
+            if not found.startswith(("ничего", "поиск не", "пустой")):
+                msgs.insert(-1, {"role": "system", "content": "Найдено в сети по теме сообщения (опирайся строго на это; "
+                                 "названия и типы вещей бери отсюда, ничего не выдумывай; если тут нет ответа или найденное "
+                                 "про другое — честно скажи, что не знаешь, или поищи точнее через web_search):\n" + found[:2000]})
         said = []                              # текст, который модель написала вместе с вызовом инструмента
         for _ in range(4):
             choice = {"type": "function", "function": {"name": "web_search"}} if force else None
