@@ -218,6 +218,14 @@ none = asyncio.run(B.wiki_article("Фантом\nhttps://ru.minecraft.wiki/w/Ф�
 B.web.get = real_get
 check("статья вики — та, что про вопрос", picked[:1] == ["Руководство:Ферма железа"], picked)
 check("статья не про то — не берём", none is None)
+from brain import pick_tools  # noqa: E402
+names = lambda q: {t["function"]["name"] for t in pick_tools(q)}
+check("«как попасть в энд» — с поиском и без паст", "web_search" in names("как попасть в эндер мир?")
+      and "send_paste" not in names("как попасть в эндер мир?"))
+check("«кинь пасту» — пасты", "send_paste" in names("пос кинь пасту про крипера"))
+check("«как попасть в эндер мир» → портал края", wiki_words("верно, молодец, как попасть в эндер мир?") == ["портал", "края"],
+      wiki_words("верно, молодец, как попасть в эндер мир?"))
+check("незер → нижний мир", wiki_words("что есть в незере") == ["нижний", "мир"], wiki_words("что есть в незере"))
 check("правило «не выдумывай» в ядре", "ЗАПРЕТ НА ВЫДУМКУ" in config.PERSONA_CORE)
 
 print(f"\nитого: {ok} ✓, {fail} ✕")

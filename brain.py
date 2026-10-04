@@ -73,7 +73,7 @@ INTENTS = [
     ({"server_info"}, re.compile(r"сервер|айпи|\bip\b|зайти|заявк|вайтлист|правил|донат|канал|версия|админ|модер|ивент", re.I)),
     ({"set_reminder", "list_reminders"}, re.compile(r"напомн|напоминан|будильник|через \d+ ?(?:мин|час|сек|день|дн)|в \d{1,2}:\d{2}", re.I)),
     ({"generate_image"}, re.compile(r"нарису|рисуй|сгенер|картинк|арт|изобрази|покажи как выглядит", re.I)),
-    ({"send_paste"}, re.compile(r"паст", re.I)),
+    ({"send_paste"}, re.compile(r"(?<![а-яё])(?:копи)?паст(?:а|у|ы|е|ой|ами|ах)?(?![а-яё])", re.I)),   # не «попасть»
     ({"send_gif"}, re.compile(r"гиф|gif", re.I)),
 ]
 
@@ -108,6 +108,8 @@ def pick_tools(text, talk=False):
     for group, rx in INTENTS:
         if rx.search(text or ""):
             names |= group
+    if MC_HOWTO.search(text or ""):
+        names |= {"web_search", "open_page"}     # вопрос по Майнкрафту — всегда с поиском
     return [t for t in TOOLS if t["function"]["name"] in names]
 
 
@@ -160,6 +162,8 @@ class Brain:
         rounds = 4
         if mc or (needs_facts(q, ctx.get("talk")) and can_search):
             note = await self.prepare_facts(q, mc, ctx)
+            if ctx.get("_article"):
+                tools = [t for t in tools if t["function"]["name"] not in ("web_search", "open_page")]
             rounds = 2                          # уже искали: ещё один поиск максимум, дальше — ответ или «не знаю»
             ctx["_facts"] = True                # фактический вопрос: температура ниже, чтобы не присочинял мимоходом
             if note:
@@ -237,6 +241,7 @@ class Brain:
         if found.startswith(("ничего", "поиск не", "пустой")):
             return ("Поиск по этому вопросу ничего не дал. Не придумывай ответ: честно скажи, что не знаешь/не нашёл "
                     "(можно посоветовать глянуть вики или спросить на сервере).")
+        ctx["_article"] = bool(mc and article)
         if cacheable and mc and article:         # запоминаем только проверенное по вики (частые вопросы сервера)
             ctx["_grounded"] = (key, clean_q, source)
         return head + text
@@ -283,11 +288,14 @@ class Brain:
             exact = {p["title"] for p in data["query"].get("pages", {}).values() if "missing" not in p}
             cands += sorted(exact)
             stem = lambda w: w[:3] if len(w) <= 4 else w[:4] if len(w) <= 6 else w[:5]
-            for q in (" ".join(f"intitle:{stem(w)}*" for w in words[:3]), f"intitle:{stem(words[0])}*"):
+            tries = [words[:3], words[1:3], words[:1]] if len(words) > 2 else [words[:2], words[:1]]
+            for ws in (x for x in tries if x):
+                q = " ".join(f"intitle:{stem(w)}*" for w in ws)
                 data = await self.wiki_api(api, action="query", list="search", srsearch=q, srlimit=8,
                                            srnamespace="0|10014", srprop="")
-                cands += [x["title"] for x in data["query"]["search"]]
-                if cands:
+                found = [x["title"] for x in data["query"]["search"]]
+                cands += found
+                if found:
                     break
         except Exception as e:
             log.warning("поиск по вики: %r", e)
@@ -426,7 +434,13 @@ class Brain:
 
         if importlib.util.find_spec("ddgs") is None:
             # на телефоне ddgs не ставится — ищем в Википедии (без site:, он там не работает)
-            return await self.wiki_search(re.sub(r"\bsite:\S+", "", query).strip())
+            plain = re.sub(r"\bsite:\S+", "", query).strip()
+            if re.search(r"minecraft|майн", query, re.I):
+                title = await self.wiki_find(plain)
+                text = await self.wiki_text(title, plain) if title else None
+                if text:
+                    return text
+            return await self.wiki_search(plain)
 
         try:
             res = await asyncio.wait_for(asyncio.to_thread(run), 25)
@@ -532,13 +546,35 @@ STOP = {"как", "что", "это", "где", "для", "или", "мне", "�
 HOWTO_WORDS = re.compile(r"^(?:с?крафт\w*|рецепт\w*|с?дела\w*|построи\w*|постро\w*|получи\w*|добы\w*|найти|найд\w*|"
                          r"работа\w*|нужн\w*|можн\w*|майн\w*|minecraft|вики|wiki|его|её|ее|их|него|нее|неё|давай|"
                          r"скажи|объясни|покажи|подскажи|расскажи|лучш\w*|быстр\w*|прост\w*|версии|версия|"
-                         r"смотрел\w*|играл\w*|читал\w*|слышал\w*|видел\w*|знаешь|знает\w*|такое|такой|такая)$", re.I)
+                         r"смотрел\w*|играл\w*|читал\w*|слышал\w*|видел\w*|знаешь|знает\w*|такое|такой|такая|"
+                         r"попа\w*|зайти|залезть|дроп\w*|выпада\w*|падает)$", re.I)
+
+
+# сленг игроков → как называется в русской вики
+WIKI_SLANG = [(re.compile(r"^(?:эндермен\w*|эндерман\w*)$"), ["странник", "края"]),     # раньше «эндер…»
+              (re.compile(r"^(?:эндер\w*|энд|энда|энде|енд\w*|end)$"), ["края"]),
+              (re.compile(r"^(?:незер\w*|nether|ад|ада)$"), ["нижний", "мир"]),
+              (re.compile(r"^(?:визер\w*|wither)$"), ["иссушитель"]),
+              (re.compile(r"^(?:крип\w*)$"), ["крипер"])]
+CHATTER = {"верно", "молодец", "спасибо", "спс", "круто", "понял", "ладно", "кстати", "окей", "ага", "снова", "опять",
+           "крутишь", "давай", "теперь", "потом", "сначала", "вообще", "реально", "просто", "мир", "измерение"}
 
 
 def wiki_words(text):
-    """Слова-сущности вопроса (без «как», «скрафтить», «майн», версий): «как скрафтить маяк в 1.21» → [маяк]."""
-    words = re.findall(r"[а-яёa-z]+", re.sub(CALL_RX.pattern, " ", (text or "").lower(), flags=re.I))
-    return [w for w in words if len(w) >= 3 and w not in STOP and not HOWTO_WORDS.match(w)]
+    """Слова-сущности вопроса (без «как», «скрафтить», «майн», версий, болтовни), сленг → названия вики:
+    «как скрафтить маяк в 1.21» → [маяк]; «как попасть в эндер мир» → [портал, края]."""
+    raw = re.findall(r"[а-яёa-z]+", re.sub(CALL_RX.pattern, " ", (text or "").lower(), flags=re.I))
+    words = []
+    for w in raw:
+        if len(w) < 2 or w in STOP or w in CHATTER or HOWTO_WORDS.match(w):
+            continue
+        sub = next((rep for rx, rep in WIKI_SLANG if rx.match(w)), None)
+        if sub or len(w) >= 3:
+            words += sub or [w]
+    if re.search(r"попа(?:сть|сти|ду)|зайти|залезть|телепорт", (text or "").lower()) and \
+            any(w in ("края", "нижний") for w in words):
+        words.insert(0, "портал")              # «как попасть в энд» — это про портал
+    return list(dict.fromkeys(words))
 
 
 def same_word(a, b):
