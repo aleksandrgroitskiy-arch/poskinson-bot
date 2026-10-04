@@ -22,6 +22,8 @@ class Store:
           " PRIMARY KEY (guild_id, user_id, kind))")
         x("CREATE TABLE IF NOT EXISTS settings (guild_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (guild_id, key))")
         x("CREATE TABLE IF NOT EXISTS scanned (channel_id INTEGER PRIMARY KEY, ts REAL)")
+        x("CREATE TABLE IF NOT EXISTS answers (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, question TEXT,"
+          " answer TEXT, source TEXT, hits INTEGER DEFAULT 0, ts REAL)")
         self._pastes_table()
         self.db.commit()
 
@@ -178,5 +180,41 @@ class Store:
     def delete_paste(self, guild_id, name):
         self._pastes_table()
         n = self.db.execute("DELETE FROM pastes WHERE guild_id=? AND name=?", (guild_id, " ".join(name.lower().split()))).rowcount
+        self.db.commit()
+        return n
+
+    # ---- запомненные ответы ----
+    def find_answer(self, key, min_score, max_age):
+        """Самый похожий свежий ответ: key — набор основ слов вопроса. → (row, score) или (None, 0)."""
+        if len(key) < 2:
+            return None, 0
+        best, best_score = None, 0
+        for r in self.db.execute("SELECT * FROM answers WHERE ts > ?", (time.time() - max_age,)):
+            other = set(r["key"].split())
+            score = len(key & other) / len(key | other)
+            if score > best_score and len(key & other) >= 2:
+                best, best_score = r, score
+        return (best, best_score) if best_score >= min_score else (None, 0)
+
+    def save_answer(self, key, question, answer, source, min_score, keep):
+        old, _ = self.find_answer(key, min_score, 10 ** 10)
+        if old:
+            self.db.execute("UPDATE answers SET key=?, question=?, answer=?, source=?, ts=? WHERE id=?",
+                            (" ".join(sorted(key)), question, answer, source, time.time(), old["id"]))
+            rid = old["id"]
+        else:
+            rid = self.db.execute("INSERT INTO answers (key, question, answer, source, ts) VALUES (?,?,?,?,?)",
+                                  (" ".join(sorted(key)), question, answer, source, time.time())).lastrowid
+            self.db.execute("DELETE FROM answers WHERE id NOT IN (SELECT id FROM answers ORDER BY hits DESC, ts DESC LIMIT ?)",
+                            (keep,))
+        self.db.commit()
+        return rid
+
+    def hit_answer(self, rid):
+        self.db.execute("UPDATE answers SET hits=hits+1 WHERE id=?", (rid,))
+        self.db.commit()
+
+    def drop_answer(self, rid):
+        n = self.db.execute("DELETE FROM answers WHERE id=?", (rid,)).rowcount
         self.db.commit()
         return n

@@ -139,5 +139,63 @@ check("отношение — тому, кто писал боту", bot.memory.
 check("не писавшему боту — не меняется", bot.memory.rep(42) == 0, bot.memory.rep(42))
 check("буфер очищен", buf["items"] == [] and buf["first_call"] == 0)
 
+print("запомненные ответы и «не знаю»")
+from brain import qkey  # noqa: E402
+B = bot.brain
+a, b2 = qkey("поскинсон как сделать ферму железа в 1.21"), qkey("пос как сделать фермы железо 1.21")
+check("похожие вопросы — один ключ", len(a & b2) / len(a | b2) >= config.ANSWER_MATCH, (a, b2))
+calls = []
+async def fake_search(q):
+    calls.append(q)
+    return fake_search.result
+async def no_wiki(found, question=""):
+    return None
+real_search, real_wiki = B.search, B.wiki_article
+B.search, B.wiki_article = fake_search, no_wiki
+fake_search.result = "ничего не нашлось"
+ctx = {}
+note = asyncio.run(B.prepare_facts("пос как сделать ферму фантомов", True, ctx))
+check("не нашёл — велим сказать «не знаю»", "ничего не дал" in note and "_grounded" not in ctx)
+fake_search.result = "Ферма железа\nhttps://example.org\nголемы спавнятся у жителей"
+ctx = {}
+note = asyncio.run(B.prepare_facts("поскинсон как сделать ферму железа в 1.21", True, ctx))
+check("нашёл — найденное в подсказке", "големы спавнятся" in note and ctx.get("_grounded"))
+for junk in ("хз, не нашёл толком", "[крестик] не смог сгенерировать ответ, попробуй ещё раз",
+             "такого в ванили нет, это мод какой-то наверное"):
+    B.remember_answer(junk, ctx)
+check("«хз», сбои и «такого нет» не запоминаются", "answer_id" not in ctx)
+B.remember_answer("ставишь жителей с кроватями, зомби рядом, големы падают в лаву над воронками", ctx)
+check("проверенный ответ запомнен", ctx.get("answer_id"))
+n = len(calls)
+ctx2 = {}
+note2 = asyncio.run(B.prepare_facts("пос как сделать фермы железо 1.21", True, ctx2))
+check("похожий вопрос — из памяти, без поиска", len(calls) == n and "уже отвечал" in note2 and ctx2.get("answer_id") == ctx["answer_id"])
+ctx3 = {}
+asyncio.run(B.prepare_facts("пос какой сейчас курс доллара", False, ctx3))
+check("свежее (курс, новости) не запоминается", "_grounded" not in ctx3)
+check("жалоба стирает ответ", bot.store.drop_answer(ctx["answer_id"]) == 1
+      and bot.store.find_answer(a, config.ANSWER_MATCH, 10 ** 9)[0] is None)
+check("«неправильно» распознаётся", bool(bot.WRONG_RX.search("пос это неправильно, так уже не работает")))
+B.search, B.wiki_article = real_search, real_wiki
+from brain import wiki_recipes  # noqa: E402
+rec = wiki_recipes("=== Крафт ===\n{{Крафт\n|A1=Стекло |B1=Стекло |C1=Стекло\n|A2=Стекло |B2=Звезда Нижнего мира |C2=Стекло\n"
+                   "|A3=Обсидиан |B3=Обсидиан |C3=Обсидиан\n|Выход=Маяк\n|тип=Остальное\n}}")
+check("рецепт из шаблона вики читается", rec == ["Маяк — ряд 1: Стекло, Стекло, Стекло; ряд 2: Стекло, Звезда Нижнего мира, "
+                                                 "Стекло; ряд 3: Обсидиан, Обсидиан, Обсидиан"], rec)
+found = ("Железная руда\nhttps://ru.minecraft.wiki/w/Железная_руда\nруда\n\n"
+         "Ферма железа\nhttps://ru.minecraft.wiki/w/Руководство:Ферма_железа\nферма")
+picked = []
+async def fake_get(url, params=None, headers=None):
+    if params.get("titles"):
+        picked.append(params["titles"])
+    return SimpleNamespace(json=lambda: {"query": {"pages": {"1": {"extract": "текст статьи"}}}, "parse": {}})
+real_get, B.web.get = B.web.get, fake_get
+asyncio.run(B.wiki_article(found, "как сделать ферму железа"))
+none = asyncio.run(B.wiki_article("Фантом\nhttps://ru.minecraft.wiki/w/Фантом\n", "как сделать ферму железа"))
+B.web.get = real_get
+check("статья вики — та, что про вопрос", picked[:1] == ["Руководство:Ферма железа"], picked)
+check("статья не про то — не берём", none is None)
+check("правило «не выдумывай» в ядре", "ЗАПРЕТ НА ВЫДУМКУ" in config.PERSONA_CORE)
+
 print(f"\nитого: {ok} ✓, {fail} ✕")
 sys.exit(1 if fail else 0)

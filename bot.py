@@ -331,6 +331,7 @@ async def send_reply(channel, text, reference=None, started=None, files=(), gif=
     if not parts and not files:
         parts = ["…"]
     started = started or time.monotonic()
+    sent = []
     for i, part in enumerate(parts):
         delay = min(TYPING_MAX, 0.6 + len(part) / TYPING_CPS)
         if i == 0:
@@ -344,8 +345,8 @@ async def send_reply(channel, text, reference=None, started=None, files=(), gif=
             kw = {}
             if files and last and k == len(chunks) - 1:
                 kw["files"] = [discord.File(io.BytesIO(d), filename=n) for d, n in files]
-            await channel.send(c, reference=reference if i == 0 and k == 0 else None, mention_author=False,
-                               allowed_mentions=MENTIONS, **kw)
+            sent.append(await channel.send(c, reference=reference if i == 0 and k == 0 else None, mention_author=False,
+                                           allowed_mentions=MENTIONS, **kw))
     if not parts and files:
         await channel.send(files=[discord.File(io.BytesIO(d), filename=n) for d, n in files], reference=reference,
                            mention_author=False)
@@ -357,6 +358,7 @@ async def send_reply(channel, text, reference=None, started=None, files=(), gif=
             await channel.send(stickers=[sticker])
         except discord.HTTPException:
             pass
+    return sent
 
 
 async def say(guild_id, people, instruction, max_tokens=500, special=None):
@@ -496,8 +498,13 @@ async def respond(m, called, interject, note=None):
         return
     log.info("ответ %s (%s) в #%s", "по зову" if called else "сам", ctx.get("model"), getattr(m.channel, "name", "лс"))
     note_reply(m, answer, called)
-    await send_reply(m.channel, answer, reference=m if called and not note else None, started=started,
-                     files=ctx.get("files", ()), gif=ctx.get("gif"))
+    sent = await send_reply(m.channel, answer, reference=m if called and not note else None, started=started,
+                            files=ctx.get("files", ()), gif=ctx.get("gif"))
+    if ctx.get("answer_id"):
+        for x in sent:                           # «пос, неправильно» ответом на это — запомненный ответ стирается
+            answer_msgs[x.id] = ctx["answer_id"]
+        while len(answer_msgs) > 300:
+            answer_msgs.pop(next(iter(answer_msgs)))
     if ctx.get("paste"):
         name, text = ctx["paste"]
         store.used_paste(ctx["guild_id"], name)
@@ -564,6 +571,7 @@ async def on_message(m):
         return
     if m.guild and await paste_from_reply(m):
         return
+    await wrong_answer(m)
 
     if m.guild:
         pending[m.channel.id] = pending.get(m.channel.id, 0) + 1
@@ -654,6 +662,24 @@ async def talk_control(m):
 
 
 PASTE_SAVE_RX = re.compile(r"(?:запомни|сохрани|добавь|запиши)\s+(?:это\s+)?(?:как\s+)?пасту\s*(.*)", re.I | re.S)
+
+
+answer_msgs = {}        # id сообщения бота → id запомненного ответа, на котором оно основано
+WRONG_RX = re.compile(r"неправильн|неверн|не так|не то|враньё|вранье|врёшь|врешь|бред|чушь|ошиб|устарел|не работает", re.I)
+
+
+async def wrong_answer(m):
+    """Ответом на сообщение бота «неправильно / врёшь / устарело» — запомненный ответ стирается (найдётся заново)."""
+    ref = m.reference
+    rid = answer_msgs.get(ref.message_id) if ref else None
+    if not rid or not WRONG_RX.search(m.content) or len(m.content) > 120:
+        return
+    if store.drop_answer(rid):
+        log.info("стёр запомненный ответ #%s по жалобе %s: %s", rid, m.author.display_name, m.content[:80])
+        try:
+            await m.add_reaction("📝")
+        except discord.HTTPException:
+            pass
 
 
 async def paste_from_reply(m):

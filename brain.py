@@ -5,11 +5,12 @@ import json
 import logging
 import re
 from datetime import datetime
+from urllib.parse import unquote
 
 import httpx
 
 import config as cfg
-from config import CALL_RX, REMINDERS_PER_USER, TZ
+from config import ANSWER_MATCH, ANSWER_TTL_DAYS, ANSWERS_MAX, CALL_RX, REMINDERS_PER_USER, TZ, WIKI_CHARS
 from llm import RateLimited  # noqa: F401 — реэкспорт для bot.py
 
 log = logging.getLogger("poskinson.brain")
@@ -116,6 +117,7 @@ class Brain:
         self.media = media
         self.web = httpx.AsyncClient(timeout=15, follow_redirects=True,
                                      headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) poskinson"})
+        self.wiki_cache = {}
 
     async def complete(self, messages, role="chat", **kw):
         return await self.router.complete(messages, role=role, **kw)
@@ -127,7 +129,7 @@ class Brain:
             text = await self._chat(messages, ctx)
         except RateLimited:
             # вся болтовня в лимите — резерв без инструментов, лишь бы не молчать
-            m = await self.complete(messages, role="fallback", temperature=temp())
+            m = await self.complete(messages, role="fallback", temperature=temp(ctx))
             ctx["model"] = m.get("_model")
             text = clean_text(m.get("content") or "")
         if CJK.search(text):
@@ -136,43 +138,38 @@ class Brain:
             log.info("иероглифы в ответе, переспрашиваю")
             try:
                 m = await self.complete(ctx.get("_base", messages) + [{"role": "system", "content": "Отвечай строго по-русски, без иероглифов."}],
-                                        temperature=temp())
+                                        temperature=temp(ctx))
                 again = clean_text(m.get("content") or "")
                 if again and not CJK.search(again):
                     text = again
             except RateLimited:
                 pass
-        return fix_script(text)
+        text = fix_script(text)
+        if self.store is not None:
+            self.remember_answer(text, ctx)
+        return text
 
     async def _chat(self, messages, ctx):
         msgs = list(messages)
         tools = pick_tools(ctx.get("text", ""), ctx.get("talk")) if "text" in ctx else TOOLS
         force = False
         q = ctx.get("text", "")
-        if MC_HOWTO.search(q) and any(t["function"]["name"] == "web_search" for t in tools or []):
-            # вопрос по механике Майнкрафта: ищем по вики сами, не надеясь, что модель захочет
-            clean_q = re.sub(CALL_RX.pattern + r"[,!]?", "", q, flags=re.I).strip()
-            found = await self.search(clean_q + " майнкрафт site:ru.minecraft.wiki")
-            if found.startswith(("ничего", "поиск не")):
-                found = await self.search(clean_q + " minecraft wiki")
-            log.info("поиск по вики заранее: %s → %s", clean_q[:60], found[:80].replace("\n", " "))
-            msgs.insert(-1, {"role": "system", "content": "Найдено в вики по этому вопросу (отвечай строго по этому, "
-                             "своими словами; если тут нет ответа — так и скажи или поищи ещё):\n" + found[:2000]})
-        elif needs_facts(q, ctx.get("talk")) and any(t["function"]["name"] == "web_search" for t in tools or []):
-            # вопрос про конкретную вещь (аниме, сериал, игра, человек…): сначала сверяемся с сетью, а не с памятью модели
-            clean_q = re.sub(CALL_RX.pattern + r"[,!]?", "", q, flags=re.I).strip()[:200]
-            found = await self.search(clean_q)
-            log.info("проверка фактов заранее: %s → %s", clean_q[:60], found[:80].replace("\n", " "))
-            if not found.startswith(("ничего", "поиск не", "пустой")):
-                msgs.insert(-1, {"role": "system", "content": "Найдено в сети по теме сообщения (опирайся строго на это; "
-                                 "названия и типы вещей бери отсюда, ничего не выдумывай; если тут нет ответа или найденное "
-                                 "про другое — честно скажи, что не знаешь, или поищи точнее через web_search):\n" + found[:2000]})
+        can_search = any(t["function"]["name"] == "web_search" for t in tools or [])
+        mc = bool(MC_HOWTO.search(q)) and can_search
+        rounds = 4
+        if mc or (needs_facts(q, ctx.get("talk")) and can_search):
+            note = await self.prepare_facts(q, mc, ctx)
+            rounds = 2                          # уже искали: ещё один поиск максимум, дальше — ответ или «не знаю»
+            ctx["_facts"] = True                # фактический вопрос: температура ниже, чтобы не присочинял мимоходом
+            if note:
+                # в системное сообщение, а не отдельным system посреди переписки (Cloudflare такое не принимает)
+                msgs[0] = {**msgs[0], "content": msgs[0]["content"] + "\n\n" + note}
         ctx["_base"] = list(msgs)               # для переспроса без инструментов
         said = []                              # текст, который модель написала вместе с вызовом инструмента
-        for _ in range(4):
+        for _ in range(rounds):
             choice = {"type": "function", "function": {"name": "web_search"}} if force else None
             force = False                      # только на первом шаге
-            m = await self.complete(msgs, tools=tools or None, max_tokens=600, tool_choice=choice, temperature=temp())
+            m = await self.complete(msgs, tools=tools or None, max_tokens=600, tool_choice=choice, temperature=temp(ctx))
             ctx["model"] = m.get("_model")
             calls = m.get("tool_calls") or []
             if not calls:
@@ -181,7 +178,7 @@ class Brain:
                 if not visible and not said:
                     # модель ответила одними служебными строками — переспросить без инструментов
                     m2 = await self.complete(msgs + [{"role": "system", "content": "Ответь человеку текстом, коротко."}],
-                                             temperature=temp())
+                                             temperature=temp(ctx))
                     final = clean_text(m2.get("content") or "") + ("\n" + final if final else "")
                 return "\n".join(x for x in said + [final] if x and x not in final) if said else final
             if (m.get("content") or "").strip():
@@ -195,8 +192,100 @@ class Brain:
                 result = await self.run_tool(c["function"]["name"], args, ctx)
                 log.info("инструмент %s %s → %s", c["function"]["name"], args, result[:120].replace("\n", " "))
                 msgs.append({"role": "tool", "tool_call_id": c["id"], "content": result[:2500]})
-        m = await self.complete(msgs, temperature=temp())
+        m = await self.complete(msgs, temperature=temp(ctx))
         return clean_text(m.get("content") or "")
+
+    async def prepare_facts(self, q, mc, ctx):
+        """До ответа: запомненный проверенный ответ → иначе поиск (для Майнкрафта — сама статья вики) →
+        ничего не нашлось — велим честно сказать «не знаю». Возвращает заметку для подсказки."""
+        clean_q = re.sub(CALL_RX.pattern + r"[,!]?", "", q, flags=re.I).strip()[:200]
+        key = qkey(clean_q)
+        cacheable = self.store is not None and not FRESH_RX.search(clean_q) and len(key) >= 2
+        if cacheable:
+            row, score = self.store.find_answer(key, ANSWER_MATCH, ANSWER_TTL_DAYS * 86400)
+            if row:
+                self.store.hit_answer(row["id"])
+                ctx["answer_id"] = row["id"]
+                log.info("запомненный ответ #%s (%.2f): %s", row["id"], score, row["question"][:60])
+                return (f"Ты уже отвечал на похожий вопрос («{row['question']}»), ответ проверен по {row['source']}:\n"
+                        f"{row['answer']}\nЕсли спрашивают то же — ответь так же по сути, своими словами. "
+                        "Если вопрос про другое — поищи (web_search) или честно скажи, что не знаешь.")
+        if mc:
+            found = await self.search(clean_q + " майнкрафт site:ru.minecraft.wiki")
+            if found.startswith(("ничего", "поиск не")):
+                found = await self.search(clean_q + " minecraft wiki")
+            article = await self.wiki_article(found, clean_q)
+            log.info("поиск по вики заранее: %s → %s", clean_q[:60], (article or found)[:80].replace("\n", " "))
+            source, head = "вики", ("Найдено в вики по этому вопросу (отвечай строго по этому, своими словами, коротко; "
+                                    "чего тут нет — не додумывай, так и скажи):\n")
+            text = article or found[:2000]
+        else:
+            found = await self.search(clean_q)
+            log.info("проверка фактов заранее: %s → %s", clean_q[:60], found[:80].replace("\n", " "))
+            source, head = "сети", ("Найдено в сети по теме сообщения (опирайся строго на это; названия и типы вещей "
+                                    "бери отсюда, ничего не выдумывай; если тут нет ответа или найденное про другое — "
+                                    "честно скажи, что не знаешь, или поищи точнее через web_search):\n")
+            text = found[:2000]
+        if found.startswith(("ничего", "поиск не", "пустой")):
+            return ("Поиск по этому вопросу ничего не дал. Не придумывай ответ: честно скажи, что не знаешь/не нашёл "
+                    "(можно посоветовать глянуть вики или спросить на сервере).")
+        if cacheable:
+            ctx["_grounded"] = (key, clean_q, source)
+        return head + text
+
+    def remember_answer(self, text, ctx):
+        """Проверенный поиском ответ на частый вопрос — запомнить (кроме «не знаю» и пустого)."""
+        g = ctx.get("_grounded")
+        answer = re.sub(r"(?im)^\s*(?:запомни|отношение)\b.*$", "", text or "").strip()
+        if not g or len(answer) < 20 or UNSURE_RX.search(answer):
+            return
+        key, question, source = g
+        ctx["answer_id"] = self.store.save_answer(key, question, answer[:1500], source, ANSWER_MATCH, ANSWERS_MAX)
+        log.info("запомнил ответ #%s: %s", ctx["answer_id"], question[:60])
+
+    async def wiki_article(self, found, question=""):
+        """Статья ru.minecraft.wiki из результатов поиска, чьё название ближе всего к вопросу → текст для модели.
+        Ни одно название не совпало с вопросом — None (лучше сниппеты, чем статья не про то)."""
+        titles = [unquote(t).replace("_", " ") for t in re.findall(r"https://ru\.minecraft\.wiki/w/([^\s#?]+)", found or "")]
+        want = qkey(question)
+        scored = [(len(qkey(t.split(":")[-1]) & want), -i, t) for i, t in enumerate(titles)]
+        scored = [x for x in scored if x[0] > 0 or not want]
+        if not scored:
+            return None
+        return await self.wiki_text(max(scored)[2], question)
+
+    async def wiki_text(self, title, question=""):
+        """Статья вики: рецепты крафта (из шаблонов — в чистом тексте их нет) + вступление + разделы,
+        ближайшие к вопросу, в пределах WIKI_CHARS."""
+        if title not in self.wiki_cache:
+            # «браузерный» User-Agent вики встречает капчей, честный бот — пускает
+            api, ua = "https://ru.minecraft.wiki/api.php", {"User-Agent": "poskinson-bot (Discord bot)"}
+            try:
+                r = await self.web.get(api, headers=ua, params={
+                    "action": "query", "prop": "extracts", "explaintext": 1, "redirects": 1, "titles": title, "format": "json"})
+                page = next(iter(r.json()["query"]["pages"].values()))
+                text = page.get("extract") or ""
+                title = page.get("title") or title
+                r = await self.web.get(api, headers=ua, params={
+                    "action": "parse", "page": title, "prop": "wikitext", "redirects": 1, "format": "json"})
+                recipes = wiki_recipes(r.json().get("parse", {}).get("wikitext", {}).get("*", ""))
+            except Exception as e:
+                log.warning("статья вики %s: %r", title, e)
+                return None
+            self.wiki_cache[title] = (text, recipes)
+        text, recipes = self.wiki_cache[title]
+        if not text and not recipes:
+            return None
+        parts = re.split(r"\n(?===+ )", text)
+        intro, sections = parts[0].strip(), [x.strip() for x in parts[1:] if len(x.strip().splitlines()) > 1]
+        want = qkey(question)
+        sections.sort(key=lambda x: -len(qkey(x.splitlines()[0]) & want) * 3 - len(qkey(x[:600]) & want))
+        out = f"[статья «{title}»]\n" + ("Рецепты крафта:\n" + "\n".join(recipes) + "\n\n" if recipes else "") + intro
+        for sec in sections:
+            if len(out) + len(sec) > WIKI_CHARS:
+                break
+            out += "\n\n" + re.sub(r"\n{3,}", "\n\n", sec)
+        return out[:WIKI_CHARS + 500]
 
     async def run_tool(self, name, args, ctx):
         try:
@@ -281,6 +370,11 @@ class Brain:
         return "\n\n".join(f"{r.get('title', '')}\n{r.get('href', '')}\n{(r.get('body') or '')[:250]}" for r in res)
 
     async def open_page(self, url):
+        m = re.match(r"https?://ru\.minecraft\.wiki/w/([^\s#?]+)", url or "")
+        if m:                                   # вики — через её API (сама страница отдаёт капчу)
+            text = await self.wiki_text(unquote(m.group(1)).replace("_", " "))
+            if text:
+                return text
         if not re.match(r"^https?://", url or ""):
             return "нужна ссылка http(s)"
         if not await public_url(url):
@@ -338,8 +432,48 @@ def fix_script(text):
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
-def temp():
-    return cfg.CHAT_TEMPERATURE if cfg.PROMPT_V2 else 0.75
+def wiki_recipes(wikitext):
+    """{{Крафт |A1=Стекло |B2=Звезда Нижнего мира … |Выход=Маяк}} → «Маяк: ряд 1: Стекло, Стекло, Стекло; …»."""
+    out = []
+    for body in re.findall(r"\{\{Крафт\s*\|(.*?)\}\}", wikitext or "", re.S)[:4]:
+        args = {}
+        for part in body.split("|"):
+            k, _, v = part.partition("=")
+            args[k.strip()] = re.sub(r"\s+", " ", v).strip()
+        grid = [[args.get(f"{c}{r}") or "пусто" for c in "ABC"] for r in "123"]
+        grid = [row for row in grid if any(x != "пусто" for x in row)]
+        if not grid:
+            continue
+        shape = " (в любом порядке)" if args.get("бесформенный") else ""
+        rows = "; ".join(f"ряд {i + 1}: " + ", ".join(row) for i, row in enumerate(grid))
+        out.append(f"{args.get('Выход', '?')}{shape} — {rows}")
+    return out
+
+
+# свежее (новости, цены, «сейчас») не запоминаем — устаревает
+FRESH_RX = re.compile(r"новост|цен[аыуе]?\b|курс|погод|сейчас|сегодня|вчера|завтра|счёт|счет|матч|выиграл|выйдет|скоро", re.I)
+# «не знаю», отказы и сбои модели — не запоминаем (иначе мусор будет повторяться месяц)
+UNSURE_RX = re.compile(r"(?<![\w])хз(?![\w])|не знаю|не нашёл|не нашел|не нашлось|без понятия|не уверен|не помню|"
+                       r"не смог(?!л)|не могу(?!т)|попробуй ещё|попробуй еще|повтори|ошибк|такого[^.!?\n]{0,25}нет|нет такого|не существует|"
+                       r"^\s*\[", re.I)
+STOP = {"как", "что", "это", "где", "для", "или", "мне", "тебе", "тебя", "его", "так", "там", "тут", "вот", "уже", "еще",
+        "надо", "нужно", "можно", "есть", "был", "была", "было", "быть", "про", "при", "без", "над", "под", "чем",
+        "чтобы", "если", "когда", "какой", "какая", "какие", "какое", "знаешь", "скажи", "подскажи", "расскажи",
+        "плз", "пожалуйста", "ребят", "народ", "кто", "нибудь", "вообще", "короче", "слушай", "блин", "ваще"}
+
+
+def qkey(text):
+    """Вопрос → набор основ слов и чисел-версий: «как сделать ферму железа» ≈ «как сделать фермы железо»."""
+    text = re.sub(CALL_RX.pattern, " ", (text or "").lower().replace("ё", "е"), flags=re.I)
+    words = re.findall(r"[a-zа-я]+|\d+(?:\.\d+)*", text)
+    return {w if w[0].isdigit() else w[:4] if len(w) <= 6 else w[:5]
+            for w in words if w[0].isdigit() or (len(w) >= 3 and w not in STOP)}
+
+
+def temp(ctx=None):
+    if not cfg.PROMPT_V2:
+        return 0.75
+    return cfg.FACT_TEMPERATURE if ctx and ctx.get("_facts") else cfg.CHAT_TEMPERATURE
 
 
 def clean_text(text):
