@@ -100,3 +100,14 @@ scp phone:~/discord-bot/memory.db ~/   # забрать память
 `aleksandrgroitskiy-arch/poskinson-memory` через deploy key `~/.ssh/memory_deploy`. `.env` не копируется.
 Лог: `logs/push-memory.log`. Вручную: `tools/push-memory.sh` на телефоне. ПК в 06:00 забирает копию с GitHub
 (`poskinson-memory-backup`). Восстановить: остановить бота, `scp memory.db phone:discord-bot/memory.db`, запустить.
+
+### Быстрый статус хоста
+На телефоне команда `status` (`tools/status.sh`): батарея и заряд (fastfetch), нагрузка, tmux-сессии `bot` и `memsync`, онлайн ли бот, время последней копии памяти. Для интерактивного вида стоит `htop` (btop в репозитории Termux нет).
+
+### Мониторинг на айфон (ntfy + Scriptable)
+Хост раз в 5 минут (`tools/monitor.py loop`, tmux-сессия `monitor`, автозапуск в Termux:Boot) шлёт сводку (батарея, память, диск, бот, лимит Groq, возраст копии памяти) в ntfy.sh, топик `<T>-status`, и тревоги в `<T>-alert`: бот упал, не на зарядке больше 20 минут, батарея ≤20%, мало памяти или места, лимит ≥85%, копия памяти старше 30 ч. Когда проблема уходит — одно сообщение «снова в порядке».
+Секретная часть топика `<T>` лежит на хосте в `~/.monitor-topic`, на ПК в `~/.config/poskinson-monitor/topic` (не в гите).
+Сторож на ПК (`~/.local/bin/poskinson-watchdog`, таймер раз в 5 минут) шлёт тревогу, если сводка не приходила больше 15 минут. Виджет для айфона: `tools/ios/status-widget.js` (в репозитории с заглушкой `TOPIC_HERE`, рабочая копия — `~/.config/poskinson-monitor/widget.js`).
+
+### Сторож сессий на телефоне
+`tools/keepalive.sh` раз в минуту проверяет tmux-сессии `bot`, `memsync`, `monitor` и поднимает пропавшие (лог `logs/keepalive.log`). Работает вне tmux через `nohup`, поэтому переживает падение tmux-сервера (так 04.10.2026 в 3:36 пропали `monitor` и `memsync`, и виджет застыл). Второй экземпляр сам выходит. В `~/.termux/boot/start.sh` вместо трёх строк `tmux new` — одна: `nohup ~/discord-bot/tools/keepalive.sh >/dev/null 2>&1 &`. Если Android убьёт весь Termux, сторож умрёт вместе с ним — тут поможет только «Без ограничений» в настройках батареи.

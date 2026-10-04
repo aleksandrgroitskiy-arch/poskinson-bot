@@ -8,5 +8,6 @@ rsync -av --delete \
     --exclude '.git/' --exclude '.venv/' --exclude '__pycache__/' --exclude '*.bak*' \
     ./ phone:~/discord-bot/
 
-ssh phone 'tmux kill-session -t bot 2>/dev/null; tmux new -d -s bot "cd ~/discord-bot && while true; do python bot.py; sleep 15; done"'
+# respawn-pane перезапускает ту же команду в той же сессии — сторож keepalive.sh не успеет поднять «пропавшую» вторую копию
+ssh phone 'tmux respawn-pane -k -t bot 2>/dev/null || tmux new -d -s bot "cd ~/discord-bot && while true; do python bot.py; sleep 15; done"'
 echo "✓ код залит, бот перезапущен"
