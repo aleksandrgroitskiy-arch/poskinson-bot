@@ -249,13 +249,17 @@ class Memory:
         return True
 
     # ---------- что идёт в подсказку ----------
-    def prompt_block(self, guild_id, channel_id, people, special=None, with_kb=True):
+    def prompt_block(self, guild_id, channel_id, people, special=None, with_kb=True, full=None):
+        """full — кому давать полную карточку (остальным одна строка: ник + отношение); None — первым четырём."""
         out = []
-        for uid, name in list(people.items())[:4]:      # автор и до трёх собеседников
+        for uid, name in list(people.items())[:6 if full is not None else 4]:
+            mood = (special or {}).get(uid) or f"Твоё отношение: {self.tier(self.rep(uid))}"
+            if full is not None and uid not in full:
+                out.append(f"[{name}] {mood}")
+                continue
             card, _ = self.card(uid)
             card = card[:450]
             fresh = self.fresh_facts(uid, limit=MAX_FACTS)
-            mood = (special or {}).get(uid) or f"Твоё отношение: {self.tier(self.rep(uid))}"
             s = f"[{name}] {mood}\n" + (card + "\n" if card else "")
             if fresh:
                 s += "Свежее: " + "; ".join(fresh)

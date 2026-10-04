@@ -8,6 +8,7 @@ from datetime import datetime
 
 import httpx
 
+import config as cfg
 from config import CALL_RX, REMINDERS_PER_USER, TZ
 from llm import RateLimited  # noqa: F401 — реэкспорт для bot.py
 
@@ -126,14 +127,21 @@ class Brain:
             text = await self._chat(messages, ctx)
         except RateLimited:
             # вся болтовня в лимите — резерв без инструментов, лишь бы не молчать
-            m = await self.complete(messages, role="fallback")
+            m = await self.complete(messages, role="fallback", temperature=temp())
             ctx["model"] = m.get("_model")
             text = clean_text(m.get("content") or "")
         if CJK.search(text):
             # Qwen иногда срывается в китайский: одна повторная попытка, потом вырезаем
+            # без инструментов и без повторного поиска: те же сообщения (с уже найденным), что видела модель
             log.info("иероглифы в ответе, переспрашиваю")
-            again = await self._chat(messages + [{"role": "system", "content": "Отвечай строго по-русски, без иероглифов."}], ctx)
-            text = again if not CJK.search(again) else again
+            try:
+                m = await self.complete(ctx.get("_base", messages) + [{"role": "system", "content": "Отвечай строго по-русски, без иероглифов."}],
+                                        temperature=temp())
+                again = clean_text(m.get("content") or "")
+                if again and not CJK.search(again):
+                    text = again
+            except RateLimited:
+                pass
         return fix_script(text)
 
     async def _chat(self, messages, ctx):
@@ -159,11 +167,12 @@ class Brain:
                 msgs.insert(-1, {"role": "system", "content": "Найдено в сети по теме сообщения (опирайся строго на это; "
                                  "названия и типы вещей бери отсюда, ничего не выдумывай; если тут нет ответа или найденное "
                                  "про другое — честно скажи, что не знаешь, или поищи точнее через web_search):\n" + found[:2000]})
+        ctx["_base"] = list(msgs)               # для переспроса без инструментов
         said = []                              # текст, который модель написала вместе с вызовом инструмента
         for _ in range(4):
             choice = {"type": "function", "function": {"name": "web_search"}} if force else None
             force = False                      # только на первом шаге
-            m = await self.complete(msgs, tools=tools or None, max_tokens=600, tool_choice=choice)
+            m = await self.complete(msgs, tools=tools or None, max_tokens=600, tool_choice=choice, temperature=temp())
             ctx["model"] = m.get("_model")
             calls = m.get("tool_calls") or []
             if not calls:
@@ -171,7 +180,8 @@ class Brain:
                 visible = re.sub(r"(?im)^\s*(?:запомни|отношение)\b.*$", "", final).strip()
                 if not visible and not said:
                     # модель ответила одними служебными строками — переспросить без инструментов
-                    m2 = await self.complete(msgs + [{"role": "system", "content": "Ответь человеку текстом, коротко."}])
+                    m2 = await self.complete(msgs + [{"role": "system", "content": "Ответь человеку текстом, коротко."}],
+                                             temperature=temp())
                     final = clean_text(m2.get("content") or "") + ("\n" + final if final else "")
                 return "\n".join(x for x in said + [final] if x and x not in final) if said else final
             if (m.get("content") or "").strip():
@@ -185,7 +195,7 @@ class Brain:
                 result = await self.run_tool(c["function"]["name"], args, ctx)
                 log.info("инструмент %s %s → %s", c["function"]["name"], args, result[:120].replace("\n", " "))
                 msgs.append({"role": "tool", "tool_call_id": c["id"], "content": result[:2500]})
-        m = await self.complete(msgs)
+        m = await self.complete(msgs, temperature=temp())
         return clean_text(m.get("content") or "")
 
     async def run_tool(self, name, args, ctx):
@@ -326,6 +336,10 @@ def fix_script(text):
     # одиночная латинская буква-двойник перед русским словом («A теперь»)
     text = re.sub(r"\b([AaOoEeCcKkMmTtXxPpBbHy])(?=\s+[а-яё])", lambda m: m.group(1).translate(LAT2CYR), text)
     return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+def temp():
+    return cfg.CHAT_TEMPERATURE if cfg.PROMPT_V2 else 0.75
 
 
 def clean_text(text):

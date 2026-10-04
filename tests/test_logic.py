@@ -86,5 +86,58 @@ check("откровенное в 18+ канале — можно", not forbidden
 check("с несовершеннолетними — нельзя даже в 18+", forbidden("nude teen", True) and forbidden("sexy schoolgirl", True))
 check("жесть и «ребёнок в майне» — можно везде", not forbidden("bloody zombie", False) and not forbidden("a kid playing minecraft", False))
 
+for pre in ("[Ответ poskinson] ", "[ответь на это сообщение] ", "poskinson: ", "ты (poskinson): "):
+    out = bot.save_facts(pre + "ну привет", {}, 5)
+    check(f"префикс «{pre.strip()}» вырезан", out == "ну привет", repr(out))
+check("обычное «[» в ответе не трогается", bot.save_facts("[мем] смешно", {}, 5) == "[мем] смешно")
+
+print("промпт v2: ядро + блоки")
+config.PROMPT_V2 = True
+hi = bot.persona("пос привет")
+check("на «привет» — только ядро", hi == config.PERSONA_CORE)
+check("ядро заметно короче старого", len(config.PERSONA_CORE) < len(config.PERSONA) * 0.65,
+      f"{len(config.PERSONA_CORE)} vs {len(config.PERSONA)}")
+check("крафт — блок Майнкрафта", config.BLOCK_MC in bot.persona("пос как скрафтить маяк"))
+check("айпи — блок сервера", config.BLOCK_SERVER in bot.persona("скиньте айпи сервера"))
+check("аниме — блок фактов", config.BLOCK_FACTS in bot.persona("пос смотрел аниме сага о винланде?"))
+check("напомни — блок напоминаний", config.BLOCK_REMIND in bot.persona("пос напомни через 10 минут"))
+check("в ядре нет служебных строк", "ЗАПОМНИ" not in config.PERSONA_CORE)
+config.PROMPT_V2 = False
+check("флаг выключен — старый PERSONA", bot.persona("пос привет") == config.PERSONA)
+config.PROMPT_V2 = True
+
+print("карточки: полные только у нужных")
+bot.memory.add_fact(31, "kolya", "строит замок из кварца", 5)
+bot.memory.add_fact(32, "tolya", "держит ферму свиней", 5)
+blk = bot.memory.prompt_block(5, None, {31: "kolya", 32: "tolya"}, full={31})
+check("автору — полная", "замок из кварца" in blk)
+check("остальным — только отношение", "ферму свиней" not in blk and "[tolya] Твоё отношение" in blk)
+
+print("пакетный разбор памяти")
+class FakeRouter:
+    def __init__(self, content):
+        self.content = content
+    async def complete(self, *a, **kw):
+        self.kw = kw
+        return {"content": self.content}
+fake = FakeRouter('{"facts": [{"who": "sasha", "fact": "учится на программиста в колледже"},'
+                  ' {"who": "masha", "fact": "ворует алмазы у всех подряд"},'
+                  ' {"who": "сервер", "fact": "каждую пятницу строят общую стену"}],'
+                  ' "attitude": [{"who": "sasha", "score": 2}, {"who": "dima", "score": -3}]}')
+real_router, bot.router = bot.router, fake
+buf = {"guild": 5, "first_call": 1, "items": [
+    {"id": 1, "uid": 41, "name": "sasha", "text": "пос, я учусь на программиста", "to_bot": True, "sam": False},
+    {"id": 0, "uid": 0, "name": None, "text": "о, и как оно", "to_bot": False, "sam": False},
+    {"id": 2, "uid": 42, "name": "dima", "text": "лол", "to_bot": False, "sam": False}]}
+asyncio.run(bot.extract(77, buf))
+bot.router = real_router
+check("разбор — роль extract, temperature 0", fake.kw.get("role") == "extract" and fake.kw.get("temperature") == 0)
+check("факт о том, кто писал, записан", any("программиста" in f for f in bot.store.facts(41)))
+check("о том, кого не было в чате, — нет", not bot.store.facts(43) and not any("алмазы" in f for f in bot.memory.fresh_facts(0, 5)))
+check("факт о сервере записан", any("стену" in f for f in bot.memory.fresh_facts(0, 5)))
+check("отношение — тому, кто писал боту", bot.memory.rep(41) > 0, bot.memory.rep(41))
+check("не писавшему боту — не меняется", bot.memory.rep(42) == 0, bot.memory.rep(42))
+check("буфер очищен", buf["items"] == [] and buf["first_call"] == 0)
+
 print(f"\nитого: {ok} ✓, {fail} ✕")
 sys.exit(1 if fail else 0)

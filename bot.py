@@ -22,7 +22,8 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from brain import Brain, RateLimited, fix_script
+import config as cfg
+from brain import MC_HOWTO, Brain, RateLimited, fix_script, needs_facts, pick_tools
 from config import (CALL_NAMES, CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
                     JUDGE_PROMPT, JUDGE_THRESHOLD, LOG_DIR, LOH_HOUR, MAX_PARTS, NAME, PERSONA, QUIZ_SECONDS,
                     REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SPLIT_CHANCE, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
@@ -189,6 +190,8 @@ def save_facts(text, people, guild_id, author=None):
     text = re.sub(r"<\|[^|>]*\|>", "", text)
     # модель копирует служебные пометки «[голосовое: …]», «[картинка: …]» — оставляем только текст
     text = re.sub(r"\[(?:голосовое|картинка|стикер|вложение)\s*:\s*([^\]]*)\]?", r"\1", text, flags=re.I)
+    # модель повторяет разметку подсказки в начале ответа: «[Ответ poskinson]», «[ответь на это сообщение]», «poskinson:»
+    text = re.sub(rf"^\s*(?:\[(?:ответ|ответь)[^\]]*\]|(?:ты\s*\()?{re.escape(NAME)}\)?\s*:)\s*", "", text.strip(), flags=re.I)
     return re.sub(r"\n?\s*-{3,}\s*$", "", text.strip()).strip()
 
 
@@ -358,7 +361,7 @@ async def send_reply(channel, text, reference=None, started=None, files=(), gif=
 
 async def say(guild_id, people, instruction, max_tokens=500, special=None):
     """Короткая реплика в характере по заданию (для команд и событий)."""
-    system = PERSONA + "\n" + now_line() + "\n" + memory.prompt_block(guild_id, None, people, special)
+    system = persona(instruction) + "\n" + now_line() + "\n" + memory.prompt_block(guild_id, None, people, special)
     system += "\n\nСейчас ответ уходит одним сообщением: не используй разделитель ---, стикеры и гифки."
     m = await brain.complete([{"role": "system", "content": system}, {"role": "user", "content": instruction}],
                              max_tokens=max_tokens)
@@ -401,19 +404,50 @@ def is_newbie(member):
     return bool(joined) and (datetime.now(joined.tzinfo) - joined).days < 3
 
 
+def persona(text="", talk=False, server=False):
+    """v2: короткое ядро + блоки по теме сообщения (как и инструменты); иначе — старый полный PERSONA."""
+    if not cfg.PROMPT_V2:
+        return PERSONA
+    text = text or ""
+    tools = {t["function"]["name"] for t in pick_tools(text, talk)}
+    parts = [cfg.PERSONA_CORE]
+    if MC_HOWTO.search(text):
+        parts.append(cfg.BLOCK_MC)
+    if server or "server_info" in tools:
+        parts.append(cfg.BLOCK_SERVER)
+    if needs_facts(text, talk):
+        parts.append(cfg.BLOCK_FACTS)
+    if "set_reminder" in tools:
+        parts.append(cfg.BLOCK_REMIND)
+    return "\n".join(parts)
+
+
 async def build_prompt(m, interject, with_kb=False, note=None):
     history = [x async for x in m.channel.history(limit=HISTORY, before=m)]
     history.reverse()
+    ref = m.reference.resolved if m.reference and isinstance(m.reference.resolved, discord.Message) else None
+    if cfg.PROMPT_V2:
+        # старые сообщения — шум (их покрывает сводка канала); то, на что человек отвечает, — оставляем всегда
+        since = m.created_at - timedelta(minutes=cfg.CONTEXT_MINUTES)
+        history = [x for x in history if x.created_at >= since or x == ref]
+        if ref and ref not in history:
+            history.insert(0, ref)
     history.append(m)
-    people = {m.author.id: m.author.display_name}       # автор первым, дальше — самые свежие собеседники
+    people = {m.author.id: m.author.display_name}       # автор первым, дальше — те, кому он отвечает/кого упомянул, и свежие собеседники
+    addressed = [u for u in ([ref.author] if ref else []) + list(m.mentions) if not u.bot]
+    for u in addressed:
+        people.setdefault(u.id, u.display_name)
     for x in reversed(history):
         if not x.author.bot:
             people.setdefault(x.author.id, x.author.display_name)
+    full = {m.author.id} | {u.id for u in addressed} if cfg.PROMPT_V2 else None
     gid = m.guild.id if m.guild else 0
     where = f"Канал #{m.channel.name}." if m.guild else "Личные сообщения."
     users = {x.author.id: x.author for x in history if not x.author.bot}
-    system = (PERSONA + emoji_block(m.guild) + "\n" + now_line() + " " + where + "\n"
-              + memory.prompt_block(gid, m.channel.id if m.guild else None, people, specials(users.values()), with_kb=with_kb))
+    text = m.content + " " + transcripts.get(m.id, "")
+    system = (persona(text, talk=bool(note), server=with_kb) + emoji_block(m.guild) + "\n" + now_line() + " " + where + "\n"
+              + memory.prompt_block(gid, m.channel.id if m.guild else None, people, specials(users.values()),
+                                    with_kb=with_kb, full=full))
     if m.guild and is_newbie(m.author):
         system += f"\n\n{m.author.display_name} — новичок на сервере (зашёл недавно): помоги нормально, без жёсткой прожарки."
     if m.guild:
@@ -461,6 +495,7 @@ async def respond(m, called, interject, note=None):
     if "[молчу]" in answer or (not answer and not ctx.get("files")):
         return
     log.info("ответ %s (%s) в #%s", "по зову" if called else "сам", ctx.get("model"), getattr(m.channel, "name", "лс"))
+    note_reply(m, answer, called)
     await send_reply(m.channel, answer, reference=m if called and not note else None, started=started,
                      files=ctx.get("files", ()), gif=ctx.get("gif"))
     if ctx.get("paste"):
@@ -533,6 +568,7 @@ async def on_message(m):
     if m.guild:
         pending[m.channel.id] = pending.get(m.channel.id, 0) + 1
         last_activity[m.channel.id] = time.time()
+        buffer_msg(m)
         if KB_CHANNEL_RX.search(m.channel.name):
             kb_dirty.add(m.guild.id)
     if m.guild and await talk_control(m):
@@ -1322,6 +1358,90 @@ async def summary_loop():
             pending[cid] = 0
 
 
+# ---- v2: факты и отношение — не из каждого ответа, а пакетом по накопленному чату (роль memory) ----
+extract_buf = {}        # channel_id → {"guild": id, "items": [...], "first_call": время первого обращения к боту}
+
+
+def buffer_msg(m):
+    if not cfg.PROMPT_V2:
+        return
+    text = msg_text(m)
+    if not text:
+        return
+    b = extract_buf.setdefault(m.channel.id, {"guild": m.guild.id, "items": [], "first_call": 0})
+    b["items"].append({"id": m.id, "uid": m.author.id, "name": m.author.display_name, "text": text[:400],
+                       "to_bot": False, "sam": is_sam(m.author)})
+    del b["items"][:-120]                        # на случай, если разбор долго не случается
+
+
+def note_reply(m, answer, called):
+    b = extract_buf.get(m.channel.id) if cfg.PROMPT_V2 and m.guild else None
+    if not b:
+        return
+    for it in b["items"]:
+        if it["id"] == m.id and called:
+            it["to_bot"] = True
+            b["first_call"] = b["first_call"] or time.time()
+    b["items"].append({"id": 0, "uid": 0, "name": None, "text": answer[:300], "to_bot": False, "sam": False})
+
+
+async def extract(cid, b):
+    items, b["items"], b["first_call"] = b["items"], [], 0
+    speakers = {it["name"].lower(): it for it in items if it["uid"]}
+    callers = {it["name"].lower() for it in items if it["to_bot"]}
+    lines = [f"ты ({NAME}): {it['text']}" if not it["uid"] else
+             f"{it['name']}{' (боту)' if it['to_bot'] else ''}: {it['text']}" for it in items]
+    try:
+        r = await router.complete([{"role": "system", "content": cfg.EXTRACT_PROMPT},
+                                   {"role": "user", "content": "\n".join(lines)}],
+                                  role="extract", max_tokens=500, temperature=0, json_mode=True)
+        data = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", (r.get("content") or "").strip()))
+    except (RateLimited, ValueError) as e:
+        log.warning("разбор чата не удался: %s", e)
+        return
+    gid = b["guild"]
+    for f in data.get("facts") or []:
+        who, fact = str(f.get("who", "")).strip().lstrip("@"), str(f.get("fact", "")).strip()
+        if not good_fact(fact):
+            continue
+        if who.lower() == "сервер":
+            new, due = memory.add_fact(0, "сервер", fact, gid)
+            if new:
+                log.info("запомнил о сервере: %s", fact)
+            if due:
+                schedule_consolidation(0, gid, "сервер")
+        elif who.lower() in speakers:            # только о тех, кто сам писал в этом куске (не слухи)
+            it = speakers[who.lower()]
+            new, due = memory.add_fact(it["uid"], it["name"], fact, gid)
+            if new:
+                log.info("запомнил: %s | %s", it["name"], fact)
+            if due:
+                schedule_consolidation(it["uid"], 0, it["name"])
+    for a in data.get("attitude") or []:
+        who = str(a.get("who", "")).strip().lstrip("@").lower()
+        if who not in callers:
+            continue
+        try:
+            att = max(-3, min(3, int(a.get("score", 0))))
+        except (TypeError, ValueError):
+            continue
+        if att:
+            it = speakers[who]
+            score = memory.rep_apply(it["uid"], att, sam=it["sam"])
+            log.info("отношение к %s: %+d → %.0f", it["name"], att, score)
+
+
+@tasks.loop(minutes=1)
+async def extract_loop():
+    now = time.time()
+    for cid, b in list(extract_buf.items()):
+        n = len(b["items"])
+        due = (b["first_call"] and (now - b["first_call"] >= cfg.EXTRACT_WAIT or n >= cfg.EXTRACT_MAX)) \
+            or n >= cfg.EXTRACT_IDLE_MAX
+        if due and cap_ok("extract"):
+            await extract(cid, b)
+
+
 @tasks.loop(minutes=10)
 async def maintenance_loop():
     """Ночью (4–5 утра по Москве): каталоги моделей, пересборка карточек, копия памяти."""
@@ -1382,7 +1502,7 @@ async def on_ready():
             memory.backup()
         except Exception:
             log.exception("копия памяти")
-    for loop in (talk_loop, loh_loop, reminder_loop, scan_loop, summary_loop, maintenance_loop):
+    for loop in (talk_loop, loh_loop, reminder_loop, scan_loop, summary_loop, maintenance_loop, extract_loop):
         if not loop.is_running():
             loop.start()
 
