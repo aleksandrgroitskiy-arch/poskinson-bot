@@ -23,7 +23,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 import config as cfg
-from brain import MC_HOWTO, Brain, RateLimited, fix_script, needs_facts, pick_tools
+from brain import Brain, RateLimited, fix_script, mc_question, needs_facts, pick_tools
 from config import (CALL_NAMES, CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
                     JUDGE_PROMPT, JUDGE_THRESHOLD, LOG_DIR, LOH_HOUR, MAX_PARTS, NAME, PERSONA, QUIZ_SECONDS,
                     REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SPLIT_CHANCE, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
@@ -413,7 +413,7 @@ def persona(text="", talk=False, server=False):
     text = text or ""
     tools = {t["function"]["name"] for t in pick_tools(text, talk)}
     parts = [cfg.PERSONA_CORE]
-    if MC_HOWTO.search(text):
+    if mc_question(text):
         parts.append(cfg.BLOCK_MC)
     if server or "server_info" in tools:
         parts.append(cfg.BLOCK_SERVER)
@@ -1284,13 +1284,16 @@ async def scan_guild(guild):
 
 async def scan_channel(guild, ch):
     log.info("читаю историю #%s (%s)", ch.name, guild.name)
-    msgs = [m async for m in ch.history(limit=SCAN_LIMIT) if not m.author.bot and m.content.strip()]
+    # сообщения ботов — только как контекст (иначе их сценки и дуэли разбирались как факты о людях)
+    msgs = [m async for m in ch.history(limit=SCAN_LIMIT) if (full_text(m) if m.author.bot else m.content.strip())]
     msgs.reverse()
     for m in msgs:
-        store.seen(guild.id, m.author.id, m.author.display_name, m.created_at.timestamp())
+        if not m.author.bot:
+            store.seen(guild.id, m.author.id, m.author.display_name, m.created_at.timestamp())
     chunks, cur, size = [], [], 0
     for m in msgs:
-        line = f"{m.author.display_name}: {m.clean_content[:400]}"
+        line = (f"[бот {m.author.display_name}]: {full_text(m)[:300]}" if m.author.bot
+                else f"{m.author.display_name}: {m.clean_content[:400]}")
         if size + len(line) > SCAN_CHUNK_CHARS and cur:
             chunks.append(cur)
             cur, size = [], 0
@@ -1302,6 +1305,8 @@ async def scan_channel(guild, ch):
     for i, chunk in enumerate(chunks):
         names = {}
         for m, _ in chunk:
+            if m.author.bot:
+                continue
             names[m.author.display_name.lower()] = m.author.id
             names.setdefault(m.author.name.lower(), m.author.id)
         text = "\n".join(line for _, line in chunk)
@@ -1335,7 +1340,8 @@ async def scan_channel(guild, ch):
     # сводка канала по последним сообщениям — чтобы сразу знать, о чём тут говорят
     tail = msgs[-120:]
     if tail:
-        await memory.summarize(ch.id, guild.id, ch.name, [f"{m.author.display_name}: {m.clean_content[:300]}" for m in tail],
+        await memory.summarize(ch.id, guild.id, ch.name, [f"{'[бот] ' if m.author.bot else ''}{m.author.display_name}: {(full_text(m) if m.author.bot else m.clean_content)[:300]}"
+                                                    for m in tail],
                                tail[-1].id)
     store.mark_scanned(ch.id)
     log.info("#%s прочитан: %d сообщений, %d новых фактов", ch.name, len(msgs), added)

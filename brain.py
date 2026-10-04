@@ -5,6 +5,7 @@ import importlib.util
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from urllib.parse import unquote
 
@@ -92,12 +93,34 @@ FACT_RX = re.compile(r"аниме|манг[аиу]|сериал|фильм|ки�
                      r"режисс|актёр|актер|персонаж|герой|сезон|серия|серии|эпизод|студи[яи]|разработчик|"
                      r"знаешь|слышал|смотрел|играл|читал|что за|кто так(?:ой|ая|ие)|что так(?:ое|ой)|про что|о чём|о чем|"
                      r"расскажи|объясни|правда что|правда ли|скольк|в каком году|когда вышел|откуда|кто создал|кто сделал", re.I)
+# про конкретную вещь (а не про самого бота): «ты смотрел наруто?», «что за мод»
+TOPIC_RX = re.compile(r"аниме|манг[аиу]|сериал|фильм|кино|мульт|игр[аыуе]|игру|книг|песн|трек|альбом|персонаж|"
+                      r"смотрел|играл|читал|слышал|что за|кто так(?:ой|ая|ие)|что так(?:ое|ой)|про что|о чём|о чем", re.I)
 NAMED_RX = re.compile(r"[«\"“][^»\"”]{2,60}[»\"”]|(?<=[a-zа-яё,] )[A-ZА-ЯЁ][\w'-]{2,}|\b[A-Za-z][A-Za-z0-9'-]{3,}\b")
+# «что добавили в 26.2», «последняя обнова майна» — вопрос про версию: статья версии в вики, а не Википедия
+VER_RX = re.compile(r"(?<![\d.])(1\.\d{1,2}(?:\.\d{1,2})?|2\d\.\d{1,2}(?:\.\d{1,2})?)(?![\d.])")
+UPDATE_RX = re.compile(r"обнов|апдейт|update|снапшот|снэпшот|верси|добавил|нового|вышл|вышел|патч", re.I)
+MC_WORD_RX = re.compile(r"майн|minecraft|mc(?![a-z])", re.I)
+
+
+def mc_update(text):
+    """Вопрос про обновление/версию Майнкрафта → (версия или None, True); не про это → (None, False)."""
+    text = text or ""
+    ver = VER_RX.search(text)
+    if UPDATE_RX.search(text) and (ver or MC_WORD_RX.search(text)):
+        return (ver.group(1) if ver else None), True
+    return None, False
+
+
+def mc_question(text):
+    return bool(MC_HOWTO.search(text or "")) or mc_update(text)[1]
 
 
 def needs_facts(text, talk=False):
     """Нужно ли проверить факты в сети до ответа (есть вопрос про конкретную вещь, а не просто болтовня)."""
     text = text or ""
+    if PERSONAL_RX.search(POLITE_RX.sub(" ", text)) and not TOPIC_RX.search(text) and not NAMED_RX.search(text):
+        return False                             # «сколько ты скурил?» — про бота, искать нечего
     if FACT_RX.search(text):
         return True
     return talk and bool(NAMED_RX.search(text))
@@ -110,7 +133,7 @@ def pick_tools(text, talk=False):
     for group, rx in INTENTS:
         if rx.search(text or ""):
             names |= group
-    if MC_HOWTO.search(text or ""):
+    if mc_question(text):
         names |= {"web_search", "open_page"}     # вопрос по Майнкрафту — всегда с поиском
     return [t for t in TOOLS if t["function"]["name"] in names]
 
@@ -160,7 +183,7 @@ class Brain:
         force = False
         q = ctx.get("text", "")
         can_search = any(t["function"]["name"] == "web_search" for t in tools or [])
-        mc = bool(MC_HOWTO.search(q)) and can_search
+        mc = mc_question(q) and can_search
         rounds = 4
         if mc or (needs_facts(q, ctx.get("talk")) and can_search):
             note = await self.prepare_facts(q, mc, ctx)
@@ -218,7 +241,21 @@ class Brain:
                 return (f"Ты уже отвечал на похожий вопрос («{row['question']}»), ответ проверен по {row['source']}:\n"
                         f"{row['answer']}\nЕсли спрашивают то же — ответь так же по сути, своими словами. "
                         "Если вопрос про другое — поищи (web_search) или честно скажи, что не знаешь.")
-        if mc:
+        ver, upd = mc_update(clean_q)
+        if not upd and not wiki_words(clean_q):
+            ver, upd = mc_update(ctx.get("recent", ""))   # «ну расскажи о ней» после разговора про 26.2
+        if upd:
+            mc = True
+            cacheable = cacheable and bool(ver)  # «последняя обнова» со временем меняется
+            ver = ver or await self.latest_version()
+        if mc and upd and ver:
+            article = await self.wiki_text(f"{ver} (Java Edition)", clean_q)
+            found = article or "ничего не нашлось"
+            log.info("версия %s заранее: %s → %s", ver, clean_q[:60], found[:80].replace("\n", " "))
+            source, head = "вики", (f"Последняя вышедшая версия Java Edition — {await self.latest_version() or '?'}. "
+                                    f"Статья вики про версию {ver}, отвечай по ней, коротко, своими словами:\n")
+            text = found[:2500]
+        elif mc:
             # вопрос без предмета («да, как его скрафтить») — предмет берём из последних реплик
             topic = clean_q if wiki_words(clean_q) else (ctx.get("recent", "") + " " + clean_q)
             title = await self.wiki_find(topic)
@@ -235,7 +272,8 @@ class Brain:
                                     "это есть в тексте; чего нет — не упоминай вовсе:\n")
             text = article or found[:2000]
         else:
-            found = await self.search(" ".join(wiki_words(clean_q)) or clean_q)
+            words = wiki_words(clean_q) or wiki_words(ctx.get("recent", ""))   # «расскажи о ней» — тема из прошлых реплик
+            found = await self.search(" ".join(words) or clean_q)
             log.info("проверка фактов заранее: %s → %s", clean_q[:60], found[:80].replace("\n", " "))
             source, head = "сети", ("Найдено в сети по теме сообщения (опирайся строго на это; названия и типы вещей "
                                     "бери отсюда, ничего не выдумывай; если тут нет ответа или найденное про другое — "
@@ -310,12 +348,27 @@ class Brain:
         scored = [x for x in scored if x[0] > 0]
         return max(scored)[3] if scored else None
 
+    async def latest_version(self):
+        """Последняя вышедшая версия Java Edition из шаблона вики (кешируется на 6 часов)."""
+        v, t = getattr(self, "_latest", (None, 0))
+        if v and time.monotonic() - t < 6 * 3600:
+            return v
+        try:
+            data = await self.wiki_api("https://ru.minecraft.wiki/api.php", action="expandtemplates", prop="wikitext",
+                                       text="{{v|без ссылки=1|java}}")
+            v = VER_RX.search(data["expandtemplates"]["wikitext"]).group(1)
+            self._latest = (v, time.monotonic())
+        except Exception as e:
+            log.warning("последняя версия: %r", e)
+        return v
+
     async def wiki_search(self, query):
         """Запасной поиск без ddgs (на телефоне его нет): русская Википедия — названия, сниппеты и начало лучшей статьи."""
         api = "https://ru.wikipedia.org/w/api.php"
         try:
             data = await self.wiki_api(api, action="query", list="search", srsearch=query, srlimit=4)
-            hits = data["query"]["search"]
+            want = qkey(query)
+            hits = [h for h in data["query"]["search"] if qkey(h["title"]) & want]   # «Инцидент с Boeing» на «последняя обнова» — мимо
             if not hits:
                 return "ничего не нашлось"
             data = await self.wiki_api(api, action="query", prop="extracts", exintro=1, explaintext=1,
@@ -549,7 +602,7 @@ UNSURE_RX = re.compile(r"(?<![\w])хз(?![\w])|не знаю|не нашёл|н�
 STOP = {"как", "что", "это", "где", "для", "или", "мне", "тебе", "тебя", "его", "так", "там", "тут", "вот", "уже", "еще",
         "надо", "нужно", "можно", "есть", "был", "была", "было", "быть", "про", "при", "без", "над", "под", "чем",
         "чтобы", "если", "когда", "какой", "какая", "какие", "какое", "знаешь", "скажи", "подскажи", "расскажи",
-        "плз", "пожалуйста", "ребят", "народ", "кто", "нибудь", "вообще", "короче", "слушай", "блин", "ваще"}
+        "плз", "пожалуйста", "ней", "ним", "них", "нем", "нём", "ему", "она", "они", "оно", "этом", "этой", "этого", "ребят", "народ", "кто", "нибудь", "вообще", "короче", "слушай", "блин", "ваще"}
 
 
 HOWTO_WORDS = re.compile(r"^(?:с?крафт\w*|рецепт\w*|с?дела\w*|построи\w*|постро\w*|получи\w*|добы\w*|найти|найд\w*|"
@@ -611,4 +664,5 @@ def temp(ctx=None):
 
 
 def clean_text(text):
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    return re.sub(r"```\w*\s*```", "", text).strip()     # пустой блок кода в конце ответа
