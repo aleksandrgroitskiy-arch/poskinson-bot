@@ -228,6 +228,12 @@ check("«как попасть в эндер мир» → портал края"
 check("незер → нижний мир", wiki_words("что есть в незере") == ["нижний", "мир"], wiki_words("что есть в незере"))
 check("«как попасть в ад» — вопрос по Майнкрафту", "web_search" in names("пос как попасть в ад"))
 check("«ад» → нижний мир", wiki_words("пос как попасть в ад") == ["портал", "нижний", "мир"], wiki_words("пос как попасть в ад"))
+from brain import MC_HOWTO, PERSONAL_RX, POLITE_RX  # noqa: E402
+personal = lambda q: bool(PERSONAL_RX.search(POLITE_RX.sub(" ", q)))
+check("«бурбакрафт» — не вопрос про крафт", not MC_HOWTO.search("когда будешь играть на бурбакрафте"))
+check("«скрафтить» — по-прежнему про крафт", bool(MC_HOWTO.search("как скрафтить маяк")))
+check("личный вопрос не запоминается", personal("когда будешь играть на бурбакрафте"))
+check("«ты знаешь, как…» — не личный", not personal("ты знаешь как варить зелья"))
 check("правило «не выдумывай» в ядре", "ЗАПРЕТ НА ВЫДУМКУ" in config.PERSONA_CORE)
 
 print(f"\nитого: {ok} ✓, {fail} ✕")
