@@ -17,7 +17,7 @@ def _load_env(path):
 
 
 _load_env(HERE / ".env")
-VERSION = "3.10.0-beta"
+VERSION = "3.10.1-beta"
 TOKEN = os.environ["DISCORD_TOKEN"]
 NAME = os.environ.get("BOT_NAME") or "poskinson"
 TZ = ZoneInfo("Europe/Moscow")
@@ -35,6 +35,7 @@ def key(name):
 PROVIDERS = {
     "groq": {"base": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY"},
     "groq2": {"base": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY_2"},   # второй аккаунт: подхватывает, когда у первого кончился дневной лимит
+    "groq3": {"base": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY_3"},   # третий — после второго
     "cerebras": {"base": "https://api.cerebras.ai/v1", "key": "CEREBRAS_API_KEY"},
     "nvidia": {"base": "https://integrate.api.nvidia.com/v1", "key": "NVIDIA_API_KEY"},
     # Cloudflare Workers AI: бесплатно 10 000 «нейронов» в сутки; Kimi/DeepSeek/GLM — только на платном тарифе
@@ -128,9 +129,9 @@ MODELS["bulk"] = [
     ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
     ("openrouter", "qwen/qwen3.8-27b:free"),
 ]
-# у каждой модели Groq сразу после неё — то же самое со вторым ключом (первый «ляжет» на дневном лимите — пойдёт второй)
+# у каждой модели Groq сразу после неё — то же самое со вторым и третьим ключом (ключ «ляжет» на дневном лимите — пойдёт следующий)
 for _lst in MODELS.values():
-    _lst[:] = [x for pm in _lst for x in ((pm, ("groq2", pm[1])) if pm[0] == "groq" else (pm,))]
+    _lst[:] = [x for pm in _lst for x in ((pm, ("groq2", pm[1]), ("groq3", pm[1])) if pm[0] == "groq" else (pm,))]
 
 VOICE_MODEL = ("groq", "whisper-large-v3-turbo")
 
@@ -186,9 +187,9 @@ SAM_FLIP = 0.3                # шанс, что настроение к нем�
 
 # ---- дневные лимиты провайдеров (для виджета-монитора и решений) ----
 # токенов в сутки на модель: Groq free ≈200 тыс. (у qwen подтверждено ошибкой TPD); None — не по токенам
-# два ключа Groq → в виджете 400 тыс. (2 × 200 тыс.)
-DAILY_TOKEN_LIMITS = {("groq", "qwen/qwen3.8-27b"): 400_000, ("groq", "openai/gpt-oss-120b"): 400_000,
-                      ("groq", "openai/gpt-oss-20b"): 400_000}
+# три ключа Groq → в виджете 600 тыс. (3 × 200 тыс.)
+DAILY_TOKEN_LIMITS = {("groq", "qwen/qwen3.8-27b"): 600_000, ("groq", "openai/gpt-oss-120b"): 600_000,
+                      ("groq", "openai/gpt-oss-20b"): 600_000}
 DAILY_REQUEST_LIMITS = {"openrouter": 50}     # запросов в сутки на провайдера
 
 # ---- защита от слива лимитов на большом сервере ----
