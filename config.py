@@ -17,7 +17,7 @@ def _load_env(path):
 
 
 _load_env(HERE / ".env")
-VERSION = "3.9.5-beta"
+VERSION = "3.10.0-beta"
 TOKEN = os.environ["DISCORD_TOKEN"]
 NAME = os.environ.get("BOT_NAME") or "poskinson"
 TZ = ZoneInfo("Europe/Moscow")
@@ -121,6 +121,13 @@ MODELS = {
         ("nvidia", "meta/llama-3.2-90b-vision-instruct"),
     ],
 }
+# крупные фоновые задачи одним запросом (вся история канала, пачка карточек, база сервера): у бесплатного
+# OpenRouter лимит на ЗАПРОСЫ (~50 в день), а не на токены, и окно огромное — Groq остаётся под болтовню
+MODELS["bulk"] = [
+    ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+    ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
+    ("openrouter", "qwen/qwen3.8-27b:free"),
+]
 # у каждой модели Groq сразу после неё — то же самое со вторым ключом (первый «ляжет» на дневном лимите — пойдёт второй)
 for _lst in MODELS.values():
     _lst[:] = [x for pm in _lst for x in ((pm, ("groq2", pm[1])) if pm[0] == "groq" else (pm,))]
@@ -160,6 +167,9 @@ KB_LIMIT = 300                # сообщений из каждого инфо-
 KB_CHANNEL_RX = re.compile(r"инфо|info|правил|rules|faq|чаво|вопрос|гайд|guide|как-?зайти|start|начал|заявк|апплик|"
                            r"анонс|announce|новост|news|донат|donat|магазин|shop|ip|подключ|важн|readme|помощ|help", re.I)
 SCAN_CHUNK_CHARS = 9000       # кусок истории на один запрос (~3–4 тыс. токенов)
+SCAN_BULK_CHARS = 120000      # вся история канала одним запросом через bulk (~50 тыс. токенов; старее — обрезается)
+BULK_TIMEOUT = 300             # сколько ждать ответа на крупный фоновый запрос (секунд)
+CARD_BATCH = 6                # карточек людей в одном запросе bulk (больше — модель путает людей)
 SCAN_PAUSE = 30               # пауза между кусками (лимиты делятся между провайдерами)
 
 # ---- репутация (скрытая) ----
@@ -189,7 +199,8 @@ DAILY_CAPS = {"judge": 120,     # оценка «влезть ли» (~600 то�
               "summary": 30,    # сводки каналов (~2500)
               "scan": 60,       # чтение истории при добавлении (~3500)
               "card": 40,       # пересборка карточек людей (~1500)
-              "image": 60}
+              "image": 60,
+              "bulk": 25}       # запросы OpenRouter под фон (из ~45 в день; остальное — резерв болтовни)
 IMAGES_PER_USER_HOUR = 4
 REMINDERS_PER_USER = 10
 PASTES_PER_USER = 30

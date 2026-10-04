@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from config import MODELS, PROVIDERS, key
+from config import BULK_TIMEOUT, MODELS, PROVIDERS, key
 
 log = logging.getLogger("poskinson.llm")
 
@@ -108,6 +108,8 @@ class Router:
 
     async def complete(self, messages, role="chat", tools=None, max_tokens=900, temperature=0.75, json_mode=False,
                        tool_choice=None):
+        # крупные фоновые запросы (bulk) думают минуты — им своё время ожидания, болтовне — обычное
+        wait = httpx.Timeout(BULK_TIMEOUT, connect=15) if role == "bulk" else httpx.USE_CLIENT_DEFAULT
         last = None
         if role == "chat":
             self.chat_times.append(time.monotonic())
@@ -120,6 +122,9 @@ class Router:
                 body["reasoning_effort"] = "none" if m.startswith("qwen/") else "low"
             elif "gpt-oss" in m:
                 body["reasoning_effort"] = "low"
+            if p == "openrouter":
+                # иначе бесплатные модели тратят весь ответ на рассуждения (Nemotron — вслух, Qwen — пустой ответ)
+                body["reasoning"] = {"enabled": False, "exclude": True}
             if tools:
                 body["tools"] = tools
                 if tool_choice:
@@ -127,13 +132,14 @@ class Router:
             if json_mode:
                 body["response_format"] = {"type": "json_object"}
             try:
-                r = await self.clients[p].post("/chat/completions", json=body)
+                r = await self.clients[p].post("/chat/completions", json=body, timeout=wait)
                 if r.status_code == 400 and "tool_use_failed" in r.text and "tool_choice" in body:
                     # модель не захотела вызывать обязательный инструмент — та же модель, но без принуждения
                     body.pop("tool_choice")
-                    r = await self.clients[p].post("/chat/completions", json=body)
+                    r = await self.clients[p].post("/chat/completions", json=body, timeout=wait)
             except httpx.HTTPError as e:
                 last = f"{p}:{m} сеть {e!r}"
+                log.warning(last)
                 self.resting[(p, m)] = time.monotonic() + 60
                 self._count(p, m, False)
                 continue

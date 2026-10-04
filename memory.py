@@ -12,6 +12,7 @@
 """
 import json
 import logging
+import re
 import sqlite3
 import time
 from datetime import datetime
@@ -37,6 +38,11 @@ CARD_PROMPT = """Ты ведёшь досье на участника Discord-с
 Косяки и мемы: …
 - Всего не больше 700 символов. Только карточка, без вступлений."""
 
+BATCH_SUFFIX = """
+
+Сейчас людей несколько: на каждый блок «### id=…» — своя карточка по тем же правилам; факты одного человека другому не переносить.
+Ответ — только JSON без пояснений: {"cards": {"<id>": "<карточка>", …}}"""
+
 SERVER_CARD_PROMPT = """Ты ведёшь «лор» Discord-сервера друзей для бота-тролля.
 Собери из старого лора и новых фактов НОВЫЙ лор: внутренние мемы и шутки, традиции, прозвища, кто есть кто, общие истории.
 СТРОГО только то, что прямо есть в фактах или старом лоре — ничего не придумывай и не приукрашивай; по строке на факт, мало фактов — мало строк.
@@ -61,6 +67,18 @@ KB_PROMPT = """Ниже сообщения из информационных к�
 Ссылки: сайт, карта, соцсети, если есть
 Важные анонсы: последние 2–3, с датой
 Не больше 1800 символов. Только база, без вступлений."""
+
+
+def tidy_card(card, limit=900):
+    """Пустые разделы («Прозвища: —») долой; длинную карточку режем по целой строке."""
+    lines = [x.rstrip() for x in card.strip().splitlines()
+             if x.strip() and not re.fullmatch(r"[^:\n]{2,30}:\s*[—–-]*\s*(?:нет|не указано)?\.?\s*", x.strip(), re.I)]
+    out = ""
+    for x in lines:
+        if out and len(out) + len(x) + 1 > limit:
+            break
+        out += ("\n" if out else "") + x
+    return out[:limit]
 
 
 class Memory:
@@ -129,6 +147,39 @@ class Memory:
         log.info("карточка %s пересобрана (%d фактов) моделью %s", name or ("сервер" if not user_id else user_id),
                  len(facts), m.get("_model"))
         return True
+
+    async def consolidate_batch(self, people):
+        """Карточки нескольких людей одним запросом (роль bulk). people: [(user_id, ник)] → id, кому собрали.
+        RateLimited пробрасывается — тогда вызывающий собирает по одному, как раньше."""
+        names, blocks, started = dict(people), [], time.time()
+        for uid, name in people:
+            old, _ = self.card(uid)
+            facts = [r[0] for r in self.db.execute("SELECT fact FROM facts WHERE user_id=? ORDER BY ts", (uid,))][-120:]
+            if facts:
+                blocks.append(f"### id={uid} ник={name}\nСтарая карточка:\n{old or '(нет)'}\n"
+                              "Факты (старые сверху, новые снизу):\n" + "\n".join("- " + f for f in facts))
+        if not blocks:
+            return set()
+        m = await self.router.complete([{"role": "system", "content": CARD_PROMPT + BATCH_SUFFIX},
+                                        {"role": "user", "content": "\n\n".join(blocks)}],
+                                       role="bulk", max_tokens=400 * len(blocks) + 300, temperature=0)
+        raw = m.get("content") or ""
+        try:
+            cards = json.loads(raw[raw.index("{"):raw.rindex("}") + 1]).get("cards") or {}
+        except ValueError:
+            log.warning("карточки пачкой: ответ не JSON (%s)", m.get("_model"))
+            return set()
+        done = set()
+        for k, card in cards.items():
+            uid = int(k) if str(k).strip().isdigit() else None
+            if uid not in names or not isinstance(card, str) or len(card.strip()) < 10:
+                continue
+            self.db.execute("INSERT OR REPLACE INTO profiles VALUES (?,?,?,?,?)",
+                            (uid, 0, names[uid], tidy_card(card), started))
+            done.add(uid)
+        self.db.commit()
+        log.info("карточки пачкой: %d из %d моделью %s", len(done), len(blocks), m.get("_model"))
+        return done
 
     def needing_consolidation(self, at_least=1):
         """Все, у кого есть факты сверх карточки: [(user_id, guild_id, name)]."""
@@ -235,8 +286,12 @@ class Memory:
         """lines — сообщения инфо-каналов с пометками [канал #имя id=…]."""
         text = "\n".join(lines)[-24000:]
         try:
-            m = await self.router.complete([{"role": "system", "content": KB_PROMPT}, {"role": "user", "content": text}],
-                                           role="memory", max_tokens=1200, temperature=0)
+            try:                               # сначала OpenRouter (Groq — под болтовню), не вышло — как раньше
+                m = await self.router.complete([{"role": "system", "content": KB_PROMPT}, {"role": "user", "content": text}],
+                                               role="bulk", max_tokens=1200, temperature=0)
+            except RateLimited:
+                m = await self.router.complete([{"role": "system", "content": KB_PROMPT}, {"role": "user", "content": text}],
+                                               role="memory", max_tokens=1200, temperature=0)
         except RateLimited as e:
             log.warning("база знаний не собрана: %s", e)
             return False

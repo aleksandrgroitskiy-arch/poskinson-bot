@@ -29,7 +29,7 @@ from config import (CALL_NAMES, CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, I
                     REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SPLIT_CHANCE, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
                     SUMMARY_EVERY, SUMMARY_IDLE, TOKEN, TYPING_CPS, TYPING_MAX, TZ, VERSION, DAILY_CAPS, FLOOD_PER_MIN,
                     IMAGES_PER_USER_HOUR, KB_CHANNEL_RX, KB_LIMIT, PASTE_MAX, PASTES_PER_USER, SAM_FLIP,
-                    SAM_RX, SCAN_CHANNELS)
+                    SAM_RX, SCAN_CHANNELS, SCAN_BULK_CHARS, CARD_BATCH)
 from llm import Router
 from media import Media
 from memory import Memory
@@ -1273,13 +1273,62 @@ async def scan_guild(guild):
         # самые живые каналы, кроме инфо (их уже прочитали для базы)
         chans = [c for c in guild.text_channels if readable(c) and not KB_CHANNEL_RX.search(c.name)]
         chans.sort(key=lambda c: c.last_message_id or 0, reverse=True)
+        added = 0
         for ch in chans[:SCAN_CHANNELS]:
             if store.is_scanned(ch.id):
                 continue
             try:
-                await scan_channel(guild, ch)
+                added += await scan_channel(guild, ch) or 0
             except Exception:
                 log.exception("чтение #%s", ch.name)
+        if added:                                # карточки — один раз после всех каналов (пачками), а не после каждого
+            await consolidate_all()
+
+
+def scan_line(m):
+    return (f"[бот {m.author.display_name}]: {full_text(m)[:300]}" if m.author.bot
+            else f"{m.author.display_name}: {m.clean_content[:400]}")
+
+
+def scan_names(msgs):
+    names = {}
+    for m in msgs:
+        if not m.author.bot:
+            names[m.author.display_name.lower()] = m.author.id
+            names.setdefault(m.author.name.lower(), m.author.id)
+    return names
+
+
+def save_scan_facts(content, names, gid):
+    """Строки «ник | факт» → память. Возвращает, сколько новых."""
+    added = 0
+    for line in (content or "").splitlines():
+        if "|" not in line:
+            continue
+        who, fact = (s.strip() for s in line.split("|", 1))
+        who = who.strip("-•* @").lower()
+        if who == "сервер":
+            added += memory.add_fact(0, "сервер", fact, gid)[0]
+        elif who in names:
+            added += memory.add_fact(names[who], who, fact, gid)[0]
+    return added
+
+
+async def scan_bulk(guild, ch, msgs):
+    """Вся история канала одним запросом через OpenRouter. None — не вышло (тогда по кускам через Groq)."""
+    if not msgs or not router.candidates("bulk") or not cap_ok("bulk"):
+        return None
+    text = "\n".join(scan_line(m) for m in msgs)[-SCAN_BULK_CHARS:]
+    prompt = SCAN_PROMPT.replace("Не больше 25 строк", "Не больше 40 строк")
+    try:
+        r = await router.complete([{"role": "system", "content": prompt}, {"role": "user", "content": text}],
+                                  role="bulk", max_tokens=2500, temperature=0)
+    except RateLimited as e:
+        log.warning("#%s: целиком не прочитан (%s) — читаю по кускам", ch.name, str(e)[:120])
+        return None
+    added = save_scan_facts(r.get("content"), scan_names(msgs), guild.id)
+    log.info("#%s: прочитан целиком (%d символов) моделью %s, новых фактов: %d", ch.name, len(text), r.get("_model"), added)
+    return added
 
 
 async def scan_channel(guild, ch):
@@ -1290,10 +1339,10 @@ async def scan_channel(guild, ch):
     for m in msgs:
         if not m.author.bot:
             store.seen(guild.id, m.author.id, m.author.display_name, m.created_at.timestamp())
+    added = await scan_bulk(guild, ch, msgs)
     chunks, cur, size = [], [], 0
-    for m in msgs:
-        line = (f"[бот {m.author.display_name}]: {full_text(m)[:300]}" if m.author.bot
-                else f"{m.author.display_name}: {m.clean_content[:400]}")
+    for m in msgs if added is None else []:      # OpenRouter не справился — по кускам через Groq, как раньше
+        line = scan_line(m)
         if size + len(line) > SCAN_CHUNK_CHARS and cur:
             chunks.append(cur)
             cur, size = [], 0
@@ -1301,14 +1350,9 @@ async def scan_channel(guild, ch):
         size += len(line) + 1
     if cur:
         chunks.append(cur)
-    added = 0
+    added = added or 0
     for i, chunk in enumerate(chunks):
-        names = {}
-        for m, _ in chunk:
-            if m.author.bot:
-                continue
-            names[m.author.display_name.lower()] = m.author.id
-            names.setdefault(m.author.name.lower(), m.author.id)
+        names = scan_names(m for m, _ in chunk)
         text = "\n".join(line for _, line in chunk)
         r = None
         await yield_to_chat()
@@ -1325,15 +1369,7 @@ async def scan_channel(guild, ch):
         if r is None:
             log.warning("#%s: кусок %d пропущен — лимит", ch.name, i)
             continue
-        for line in (r.get("content") or "").splitlines():
-            if "|" not in line:
-                continue
-            who, fact = (s.strip() for s in line.split("|", 1))
-            who = who.strip("-•* @").lower()
-            if who == "сервер":
-                added += memory.add_fact(0, "сервер", fact, guild.id)[0]
-            elif who in names:
-                added += memory.add_fact(names[who], who, fact, guild.id)[0]
+        added += save_scan_facts(r.get("content"), names, guild.id)
         log.info("#%s: кусок %d/%d, новых фактов: %d", ch.name, i + 1, len(chunks), added)
         if i + 1 < len(chunks):
             await asyncio.sleep(SCAN_PAUSE)
@@ -1345,13 +1381,30 @@ async def scan_channel(guild, ch):
                                tail[-1].id)
     store.mark_scanned(ch.id)
     log.info("#%s прочитан: %d сообщений, %d новых фактов", ch.name, len(msgs), added)
-    if added:
-        await consolidate_all()
+    return added
 
 
 async def consolidate_all():
-    """Пересобрать карточки всех, у кого есть несжатые факты (по одной, с паузами — лимиты)."""
-    for uid, gid, name in memory.needing_consolidation():
+    """Пересобрать карточки всех, у кого есть несжатые факты: сначала пачками через OpenRouter,
+    что осталось — по одной через Groq, с паузами (лимиты)."""
+    todo = memory.needing_consolidation()
+    people = [(uid, name) for uid, gid, name in todo if uid and (uid, 0) not in consolidating]
+    done = set()
+    for i in range(0, len(people), CARD_BATCH):
+        part = people[i:i + CARD_BATCH]
+        if not router.candidates("bulk") or not cap_ok("bulk"):
+            break
+        consolidating.update((uid, 0) for uid, _ in part)
+        try:
+            done |= await memory.consolidate_batch(part)
+        except RateLimited as e:
+            log.warning("карточки пачкой не вышли: %s", str(e)[:120])
+            break
+        finally:
+            consolidating.difference_update((uid, 0) for uid, _ in part)
+    for uid, gid, name in todo:
+        if uid in done:
+            continue
         k = (uid, gid) if not uid else (uid, 0)
         if k in consolidating:
             continue

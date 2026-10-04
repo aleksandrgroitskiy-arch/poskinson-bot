@@ -243,6 +243,37 @@ check("«ты смотрел наруто?» — искать", nf("ты смо�
 check("«расскажи о ней» — местоимение не тема", ww("ну расскажи о ней") == [], ww("ну расскажи о ней"))
 check("пустой блок кода убирается", clean_text("ну как-то так\n\n```\n```") == "ну как-то так")
 check("промпт чтения истории: «пос» — не имя", "обращение к боту" in config.SCAN_PROMPT)
+# ---- фон через OpenRouter (роль bulk) ----
+bot.memory.add_fact(61, "vasya", "строит базу в пустыне", 5)
+bot.memory.add_fact(62, "petya", "мейнит лук", 5)
+
+
+class FakeBulk:
+    def __init__(self, content):
+        self.content, self.roles = content, []
+
+    async def complete(self, messages, role="chat", **kw):
+        self.roles.append(role)
+        return {"content": self.content, "_model": "fake"}
+
+
+fb = FakeBulk('вот: {"cards": {"61": "Кто: vasya\\nИгры: строит базу в пустыне", "999": "Кто: левый", "62": ""}}')
+real_mr, bot.memory.router = bot.memory.router, fb
+got = asyncio.run(bot.memory.consolidate_batch([(61, "vasya"), (62, "petya")]))
+check("карточки пачкой: собрана нужная", got == {61} and "пустыне" in bot.memory.card(61)[0], got)
+check("карточки пачкой: чужой id и пустая — мимо", not bot.memory.card(999)[0] and not bot.memory.card(62)[0])
+check("карточки пачкой идут через bulk", fb.roles == ["bulk"], fb.roles)
+fb.content = "не json"
+check("карточки пачкой: мусор в ответе не ломает", asyncio.run(bot.memory.consolidate_batch([(62, "petya")])) == set())
+bot.memory.router = real_mr
+names = bot.scan_names([SimpleNamespace(author=user(171, "kolya")), SimpleNamespace(author=SimpleNamespace(id=1, name="poskinson", display_name="poskinson", bot=True))])
+check("чтение истории: боты не в списке людей", names == {"kolya": 171}, names)
+check("чтение истории: факт только о знакомом нике",
+      bot.save_scan_facts("kolya | разводит аксолотлей в бункере\nposkinson | бот\n— мусор", names, 5) == 1)
+from memory import tidy_card  # noqa: E402
+check("карточка: пустые разделы убраны", tidy_card("Кто: вася\nПрозвища: —\nИгры: майн\nКосяки и мемы: -") == "Кто: вася\nИгры: майн")
+check("карточка: длинная режется по строке", tidy_card("Кто: вася\n" + "Игры: " + "x" * 950) == "Кто: вася")
+check("bulk — только OpenRouter", all(p == "openrouter" for p, _ in config.MODELS["bulk"]))
 check("правило «не выдумывай» в ядре", "ЗАПРЕТ НА ВЫДУМКУ" in config.PERSONA_CORE)
 
 print(f"\nитого: {ok} ✓, {fail} ✕")
