@@ -17,7 +17,7 @@ def _load_env(path):
 
 
 _load_env(HERE / ".env")
-VERSION = "3.9.0-beta"
+VERSION = "3.9.1-beta"
 TOKEN = os.environ["DISCORD_TOKEN"]
 NAME = os.environ.get("BOT_NAME") or "poskinson"
 TZ = ZoneInfo("Europe/Moscow")

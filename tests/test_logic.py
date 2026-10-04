@@ -150,12 +150,17 @@ async def fake_search(q):
     return fake_search.result
 async def no_wiki(found, question=""):
     return None
-real_search, real_wiki = B.search, B.wiki_article
-B.search, B.wiki_article = fake_search, no_wiki
+async def no_find(q):
+    return None
+real_search, real_wiki, real_find = B.search, B.wiki_article, B.wiki_find
+B.search, B.wiki_article, B.wiki_find = fake_search, no_wiki, no_find
 fake_search.result = "ничего не нашлось"
 ctx = {}
 note = asyncio.run(B.prepare_facts("пос как сделать ферму фантомов", True, ctx))
 check("не нашёл — велим сказать «не знаю»", "ничего не дал" in note and "_grounded" not in ctx)
+async def some_wiki(found, question=""):
+    return "[статья «Руководство:Ферма железа»] големы спавнятся у жителей"
+B.wiki_article = some_wiki
 fake_search.result = "Ферма железа\nhttps://example.org\nголемы спавнятся у жителей"
 ctx = {}
 note = asyncio.run(B.prepare_facts("поскинсон как сделать ферму железа в 1.21", True, ctx))
@@ -173,10 +178,28 @@ check("похожий вопрос — из памяти, без поиска", 
 ctx3 = {}
 asyncio.run(B.prepare_facts("пос какой сейчас курс доллара", False, ctx3))
 check("свежее (курс, новости) не запоминается", "_grounded" not in ctx3)
+ctx4 = {}
+asyncio.run(B.prepare_facts("пос смотрел сагу о винланде?", False, ctx4))
+check("не Майнкрафт (болтовня про аниме) не запоминается", "_grounded" not in ctx4)
+check("в поиск уходят сущности, без «смотрел»", calls[-1] == "сагу винланде", calls[-1])
 check("жалоба стирает ответ", bot.store.drop_answer(ctx["answer_id"]) == 1
       and bot.store.find_answer(a, config.ANSWER_MATCH, 10 ** 9)[0] is None)
 check("«неправильно» распознаётся", bool(bot.WRONG_RX.search("пос это неправильно, так уже не работает")))
-B.search, B.wiki_article = real_search, real_wiki
+B.search, B.wiki_article, B.wiki_find = real_search, real_wiki, real_find
+from brain import same_word, wiki_words  # noqa: E402
+check("слова-сущности без «как скрафтить»", wiki_words("пос как скрафтить маяк в 1.21") == ["маяк"])
+check("«да, как его скрафтить» — без сущностей (возьмём из чата)", wiki_words("да, как его скрафтить") == [])
+check("окончания: лису/лиса, кирпичи/кирпич", same_word("лису", "лиса") and same_word("кирпичи", "кирпич")
+      and not same_word("маяк", "магма"))
+seen = {}
+async def find_spy(q):
+    seen["q"] = q
+    return None
+B.wiki_find, B.search = find_spy, fake_search
+fake_search.result = "ничего не нашлось"
+asyncio.run(B.prepare_facts("да, как его скрафтить", True, {"recent": "чё, снова маяк крутишь?"}))
+B.wiki_find, B.search = real_find, real_search
+check("предмет берётся из последних реплик", "маяк" in seen.get("q", ""), seen)
 from brain import wiki_recipes  # noqa: E402
 rec = wiki_recipes("=== Крафт ===\n{{Крафт\n|A1=Стекло |B1=Стекло |C1=Стекло\n|A2=Стекло |B2=Звезда Нижнего мира |C2=Стекло\n"
                    "|A3=Обсидиан |B3=Обсидиан |C3=Обсидиан\n|Выход=Маяк\n|тип=Остальное\n}}")

@@ -1,6 +1,7 @@
 """Чат с инструментами: поиск, страницы, напоминания, картинки, гифки. Модели — через llm.Router."""
 import asyncio
 import html
+import importlib.util
 import json
 import logging
 import re
@@ -211,16 +212,23 @@ class Brain:
                         f"{row['answer']}\nЕсли спрашивают то же — ответь так же по сути, своими словами. "
                         "Если вопрос про другое — поищи (web_search) или честно скажи, что не знаешь.")
         if mc:
-            found = await self.search(clean_q + " майнкрафт site:ru.minecraft.wiki")
-            if found.startswith(("ничего", "поиск не")):
-                found = await self.search(clean_q + " minecraft wiki")
-            article = await self.wiki_article(found, clean_q)
+            # вопрос без предмета («да, как его скрафтить») — предмет берём из последних реплик
+            topic = clean_q if wiki_words(clean_q) else (ctx.get("recent", "") + " " + clean_q)
+            title = await self.wiki_find(topic)
+            article = await self.wiki_text(title, topic) if title else None
+            found = article or ""
+            if not article:
+                found = await self.search(clean_q + " майнкрафт site:ru.minecraft.wiki")
+                if found.startswith(("ничего", "поиск не")):
+                    found = await self.search(clean_q + " minecraft wiki")
+                article = await self.wiki_article(found, clean_q)
             log.info("поиск по вики заранее: %s → %s", clean_q[:60], (article or found)[:80].replace("\n", " "))
-            source, head = "вики", ("Найдено в вики по этому вопросу (отвечай строго по этому, своими словами, коротко; "
-                                    "чего тут нет — не додумывай, так и скажи):\n")
+            source, head = "вики", ("Найдено в вики по этому вопросу. Отвечай ТОЛЬКО тем, что написано ниже, своими словами, "
+                                    "коротко. Ничего не добавляй от себя: как добыть ингредиенты, советы, цифры — только если "
+                                    "это есть в тексте; чего нет — не упоминай вовсе:\n")
             text = article or found[:2000]
         else:
-            found = await self.search(clean_q)
+            found = await self.search(" ".join(wiki_words(clean_q)) or clean_q)
             log.info("проверка фактов заранее: %s → %s", clean_q[:60], found[:80].replace("\n", " "))
             source, head = "сети", ("Найдено в сети по теме сообщения (опирайся строго на это; названия и типы вещей "
                                     "бери отсюда, ничего не выдумывай; если тут нет ответа или найденное про другое — "
@@ -229,7 +237,7 @@ class Brain:
         if found.startswith(("ничего", "поиск не", "пустой")):
             return ("Поиск по этому вопросу ничего не дал. Не придумывай ответ: честно скажи, что не знаешь/не нашёл "
                     "(можно посоветовать глянуть вики или спросить на сервере).")
-        if cacheable:
+        if cacheable and mc and article:         # запоминаем только проверенное по вики (частые вопросы сервера)
             ctx["_grounded"] = (key, clean_q, source)
         return head + text
 
@@ -253,6 +261,61 @@ class Brain:
         if not scored:
             return None
         return await self.wiki_text(max(scored)[2], question)
+
+    async def wiki_api(self, base, **params):
+        r = await self.web.get(base, headers={"User-Agent": "poskinson-bot (Discord bot)"},
+                               params={"format": "json", **params})
+        return r.json()
+
+    async def wiki_find(self, question):
+        """Статья ru.minecraft.wiki по вопросу — через API самой вики (без поисковика): точные названия
+        («кирпичи» → «Кирпич») + поиск по названиям, включая «Руководство:». None — ничего похожего."""
+        words = wiki_words(question)
+        if not words:
+            return None
+        api = "https://ru.minecraft.wiki/api.php"
+        cands, exact = [], set()
+        try:
+            variants = {v.capitalize() for w in words for v in (w, w[:-1], w[:-2]) if len(v) >= 3}
+            pair = " ".join(words[:2]).capitalize()
+            variants |= {pair, "Руководство:" + pair} if len(words) > 1 else set()
+            data = await self.wiki_api(api, action="query", titles="|".join(sorted(variants)[:50]), redirects=1)
+            exact = {p["title"] for p in data["query"].get("pages", {}).values() if "missing" not in p}
+            cands += sorted(exact)
+            stem = lambda w: w[:3] if len(w) <= 4 else w[:4] if len(w) <= 6 else w[:5]
+            for q in (" ".join(f"intitle:{stem(w)}*" for w in words[:3]), f"intitle:{stem(words[0])}*"):
+                data = await self.wiki_api(api, action="query", list="search", srsearch=q, srlimit=8,
+                                           srnamespace="0|10014", srprop="")
+                cands += [x["title"] for x in data["query"]["search"]]
+                if cands:
+                    break
+        except Exception as e:
+            log.warning("поиск по вики: %r", e)
+            return None
+        def hits(title):                         # сколько слов вопроса есть в названии (с учётом окончаний)
+            tw = re.findall(r"[а-яёa-z]+", title.split(":")[-1].lower())
+            return sum(any(same_word(w, x) for x in tw) for w in words)
+        scored = [(hits(t), t in exact, -len(t), t) for t in dict.fromkeys(cands)]
+        scored = [x for x in scored if x[0] > 0]
+        return max(scored)[3] if scored else None
+
+    async def wiki_search(self, query):
+        """Запасной поиск без ddgs (на телефоне его нет): русская Википедия — названия, сниппеты и начало лучшей статьи."""
+        api = "https://ru.wikipedia.org/w/api.php"
+        try:
+            data = await self.wiki_api(api, action="query", list="search", srsearch=query, srlimit=4)
+            hits = data["query"]["search"]
+            if not hits:
+                return "ничего не нашлось"
+            data = await self.wiki_api(api, action="query", prop="extracts", exintro=1, explaintext=1,
+                                       titles=hits[0]["title"], redirects=1)
+            intro = next(iter(data["query"]["pages"].values())).get("extract", "")[:1200]
+        except Exception as e:
+            return f"поиск не сработал: {e}"
+        snip = lambda x: html.unescape(re.sub(r"<[^>]+>", "", x.get("snippet", "")))
+        out = [f"{hits[0]['title']} (Википедия)\n{intro}"]
+        out += [f"{h['title']} (Википедия)\n{snip(h)}" for h in hits[1:]]
+        return "\n\n".join(out)
 
     async def wiki_text(self, title, question=""):
         """Статья вики: рецепты крафта (из шаблонов — в чистом тексте их нет) + вступление + разделы,
@@ -361,6 +424,10 @@ class Brain:
             from ddgs import DDGS
             return DDGS().text(query, region="ru-ru", max_results=5)
 
+        if importlib.util.find_spec("ddgs") is None:
+            # на телефоне ddgs не ставится — ищем в Википедии (без site:, он там не работает)
+            return await self.wiki_search(re.sub(r"\bsite:\S+", "", query).strip())
+
         try:
             res = await asyncio.wait_for(asyncio.to_thread(run), 25)
         except Exception as e:
@@ -460,6 +527,28 @@ STOP = {"как", "что", "это", "где", "для", "или", "мне", "�
         "надо", "нужно", "можно", "есть", "был", "была", "было", "быть", "про", "при", "без", "над", "под", "чем",
         "чтобы", "если", "когда", "какой", "какая", "какие", "какое", "знаешь", "скажи", "подскажи", "расскажи",
         "плз", "пожалуйста", "ребят", "народ", "кто", "нибудь", "вообще", "короче", "слушай", "блин", "ваще"}
+
+
+HOWTO_WORDS = re.compile(r"^(?:с?крафт\w*|рецепт\w*|с?дела\w*|построи\w*|постро\w*|получи\w*|добы\w*|найти|найд\w*|"
+                         r"работа\w*|нужн\w*|можн\w*|майн\w*|minecraft|вики|wiki|его|её|ее|их|него|нее|неё|давай|"
+                         r"скажи|объясни|покажи|подскажи|расскажи|лучш\w*|быстр\w*|прост\w*|версии|версия|"
+                         r"смотрел\w*|играл\w*|читал\w*|слышал\w*|видел\w*|знаешь|знает\w*|такое|такой|такая)$", re.I)
+
+
+def wiki_words(text):
+    """Слова-сущности вопроса (без «как», «скрафтить», «майн», версий): «как скрафтить маяк в 1.21» → [маяк]."""
+    words = re.findall(r"[а-яёa-z]+", re.sub(CALL_RX.pattern, " ", (text or "").lower(), flags=re.I))
+    return [w for w in words if len(w) >= 3 and w not in STOP and not HOWTO_WORDS.match(w)]
+
+
+def same_word(a, b):
+    """Одно слово с разными окончаниями: лису/лиса, кирпичи/кирпич, ферму/ферма."""
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n >= 3 and n >= min(len(a), len(b)) - 2
 
 
 def qkey(text):

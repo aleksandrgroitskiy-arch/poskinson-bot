@@ -482,6 +482,9 @@ async def respond(m, called, interject, note=None):
             if isinstance(ref, discord.Message):
                 await see_images(ref)
             msgs, people = await build_prompt(m, interject, with_kb=bool(HELP_RX.search(m.content)) or is_newbie(m.author), note=note)
+            # последние реплики без ников — чтобы «да, как его скрафтить» нашло предмет из прошлого сообщения
+            recent = next((x["content"] for x in msgs if x["role"] == "user" and x["content"].startswith("[недавний чат")), "")
+            ctx["recent"] = " ".join(line.split(":", 1)[-1] for line in recent.splitlines()[-3:])
             answer = await brain.chat(msgs, ctx)
     except RateLimited:
         log.warning("лимит Groq")
