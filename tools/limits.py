@@ -39,7 +39,7 @@ def main():
     db = sqlite3.connect(f"file:{HERE / 'memory.db'}?mode=ro", uri=True)
     rows = {}
     for p, m, req, err, ti, to in db.execute("SELECT provider, model, requests, errors, tok_in, tok_out FROM usage WHERE day=?", (day,)):
-        p = "groq" if p in ("groq2", "groq3") else p   # три ключа Groq — в виджете одна строка на модель
+        p = "groq" if p in config.GROQ_EXTRA else p   # все ключи Groq — в виджете одна строка на модель
         a = rows.get((p, m), (0, 0, 0))
         rows[(p, m)] = (a[0] + req, a[1] + err, a[2] + ti + to)
     models, seen = [], set()
@@ -87,7 +87,7 @@ def main():
 def live():
     import urllib.request
     res = []
-    for n, key in enumerate((config.key("GROQ_API_KEY"), config.key("GROQ_API_KEY_2"), config.key("GROQ_API_KEY_3")), 1):
+    for n, key in enumerate((config.key(config.PROVIDERS[g]["key"]) for g in ("groq", *config.GROQ_EXTRA)), 1):
       if not key:
         continue
       for m in ("qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"):
