@@ -24,6 +24,7 @@ from discord.ext import tasks
 
 import config as cfg
 from brain import Brain, RateLimited, fix_script, mc_question, needs_facts, pick_tools
+from jokes import JOKE_RX, Jokes, topic_of
 from config import (CALL_NAMES, CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
                     JUDGE_PROMPT, JUDGE_THRESHOLD, LOG_DIR, LOH_HOUR, MAX_PARTS, NAME, PERSONA, QUIZ_SECONDS,
                     REACT_CHANCE, REACTIONS, ROULETTE_TIMEOUT, SPLIT_CHANCE, SCAN_CHUNK_CHARS, SCAN_LIMIT, SCAN_PAUSE, SCAN_PROMPT,
@@ -46,6 +47,7 @@ router = Router(store.db)
 media = Media(router)
 memory = Memory(store, router)
 brain = Brain(store, router, media)
+jokes = Jokes(store.db)
 
 last_interject = {}     # channel_id → время последнего вмешательства
 muted_until = {}        # channel_id → до какого времени молчит сам
@@ -60,6 +62,7 @@ consolidating = set()   # карточки, которые сейчас пере
 calls_by_user = {}      # user_id → [время обращений] — антифлуд
 images_by_user = {}     # user_id → [время рисований]
 kb_dirty = set()        # серверы, где в инфо-каналах что-то поменялось
+recent_said = {}        # channel_id → последние реплики бота (чтобы не повторялся)
 REP_RX = re.compile(r"^\s*(?:-{3,}\s*)?ОТНОШЕНИЕ\s*:\s*([+-−–]?\s*\d)\s*$", re.M | re.I)
 HELP_RX = re.compile(r"как\s+(?:за(?:йти|йду|ходить)|попасть|играть|подать|начать)|айпи|\bip\b|адрес\s+сервера|"
                      r"заявк|вайтлист|whitelist|правил|какая\s+версия|на\s+какой\s+версии|лаунчер|сборк", re.I)
@@ -370,6 +373,30 @@ async def say(guild_id, people, instruction, max_tokens=500, special=None):
     return fix_script(save_facts(m.get("content") or "", people, guild_id))
 
 
+def words(text):
+    return {w[:5] for w in re.findall(r"[a-zа-яё]{3,}", (text or "").lower().replace("ё", "е"))}
+
+
+def repeats(channel_id, text):
+    """Ответ почти повторяет одну из недавних реплик бота: много общих слов или то же начало."""
+    mine, head = words(text), " ".join(norm(text).split()[:2])
+    for old in recent_said.get(channel_id) or []:
+        other = words(old)
+        if len(mine) >= 3 and len(mine & other) / max(1, min(len(mine), len(other))) >= cfg.SIMILAR_RETRY:
+            return True
+        if len(head.split()) == 2 and len(head) >= 7 and head == " ".join(norm(old).split()[:2]):   # то же начало
+            return True
+    return False
+
+
+def remember_said(channel_id, text):
+    text = re.sub(r"(?im)^\s*(?:запомни|отношение)\b.*$", "", text or "").strip()
+    if text:
+        said = recent_said.setdefault(channel_id, [])
+        said.append(text[:300])
+        del said[:-cfg.RECENT_SAID]
+
+
 def norm(s):
     s = s.lower().replace("ё", "е")
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", s)).strip()
@@ -406,7 +433,7 @@ def is_newbie(member):
     return bool(joined) and (datetime.now(joined.tzinfo) - joined).days < 3
 
 
-def persona(text="", talk=False, server=False):
+def persona(text="", talk=False, server=False, guild_id=0):
     """v2: короткое ядро + блоки по теме сообщения (как и инструменты); иначе — старый полный PERSONA."""
     if not cfg.PROMPT_V2:
         return PERSONA
@@ -421,6 +448,10 @@ def persona(text="", talk=False, server=False):
         parts.append(cfg.BLOCK_FACTS)
     if "set_reminder" in tools:
         parts.append(cfg.BLOCK_REMIND)
+    if lexicon_text(guild_id):
+        parts.append(lexicon_text(guild_id))
+    ex = random.sample(cfg.EXAMPLES, min(cfg.EXAMPLES_SHOWN, len(cfg.EXAMPLES)))
+    parts.append("Примеры тона (только тон — не копируй ни слова):\n" + "\n".join("— " + x for x in ex))
     return "\n".join(parts)
 
 
@@ -447,7 +478,7 @@ async def build_prompt(m, interject, with_kb=False, note=None):
     where = f"Канал #{m.channel.name}." if m.guild else "Личные сообщения."
     users = {x.author.id: x.author for x in history if not x.author.bot}
     text = m.content + " " + transcripts.get(m.id, "")
-    system = (persona(text, talk=bool(note), server=with_kb) + emoji_block(m.guild) + "\n" + now_line() + " " + where + "\n"
+    system = (persona(text, talk=bool(note), server=with_kb, guild_id=gid) + emoji_block(m.guild) + "\n" + now_line() + " " + where + "\n"
               + memory.prompt_block(gid, m.channel.id if m.guild else None, people, specials(users.values()),
                                     with_kb=with_kb, full=full))
     if m.guild and is_newbie(m.author):
@@ -458,6 +489,14 @@ async def build_prompt(m, interject, with_kb=False, note=None):
         system += "\n\n" + INTERJECT_NOTE
     if note:
         system += "\n\n" + note
+    if cfg.PROMPT_V2:
+        system += "\n\n" + cfg.MEMORY_NOTE
+        said = recent_said.get(m.channel.id) or []
+        if said:
+            system += "\n\n" + cfg.ANTI_REPEAT + "\n" + "\n".join("— " + x[:160].replace("\n", " ") for x in said)
+        shape = random.choices([x for _, x in cfg.SHAPES], weights=[w for w, _ in cfg.SHAPES])[0]
+        if shape and not note and not with_kb:
+            system += "\n\n" + shape
     # недавний чат — одним блоком (контекст), а сообщение, на которое отвечаем, — отдельно и явно:
     # так модели не путают, кому отвечать, и не отвечают на старые вопросы из истории
     lines = [f"{'ты (' + NAME + ')' if x.author == client.user else x.author.display_name}: {msg_text(x)[:220]}"
@@ -499,6 +538,19 @@ async def respond(m, called, interject, note=None):
     answer = save_facts(answer, people, m.guild.id if m.guild else 0, author=m.author)
     if "[молчу]" in answer or (not answer and not ctx.get("files")):
         return
+    if repeats(m.channel.id, answer) and not ctx.get("files") and not ctx.get("_facts"):
+        log.info("ответ похож на недавний, переспрашиваю")
+        try:
+            r = await brain.complete(msgs + [{"role": "assistant", "content": answer},
+                                             {"role": "user", "content": "[это почти дословно твой недавний ответ — скажи то же "
+                                              "по смыслу совсем другими словами и по-другому построй фразу, без вступлений]"}],
+                                     temperature=1.0, max_tokens=300)
+            again = fix_script(save_facts(r.get("content") or "", people, m.guild.id if m.guild else 0, author=m.author)).strip()
+            if again and not repeats(m.channel.id, again):
+                answer = again
+        except RateLimited:
+            pass
+    remember_said(m.channel.id, answer)
     log.info("ответ %s (%s) в #%s", "по зову" if called else "сам", ctx.get("model"), getattr(m.channel, "name", "лс"))
     note_reply(m, answer, called)
     sent = await send_reply(m.channel, answer, reference=m if called and not note else None, started=started,
@@ -614,7 +666,24 @@ async def on_message(m):
                 except discord.HTTPException:
                     pass
             return
+    if called and JOKE_RX.search(m.content) and await tell_joke(m):
+        return
     await respond(m, called, interject, note=TALK_NOTE if talking else None)
+
+
+async def tell_joke(m):
+    """«пос, расскажи анекдот (про …)» — дословно с сайтов анекдотов, без нейросети. False — пусть отвечает модель."""
+    topic = topic_of(m.content)
+    async with m.channel.typing():
+        joke, on_topic = await jokes.get(m.guild.id if m.guild else 0, topic, nsfw=is_nsfw(m.channel))
+        if not joke:
+            return False
+        await asyncio.sleep(min(3.0, 0.8 + len(joke) / 120))
+    head = f"про {topic} не нашёл, держи другой\n\n" if topic and not on_topic else ""
+    note_reply(m, joke, True)
+    log.info("анекдот по зову в #%s", getattr(m.channel, "name", "лс"))
+    await send_long(m.channel, head + joke, reference=m, mentions=discord.AllowedMentions.none())
+    return True
 
 
 TALK_START_RX = re.compile(rf"(?<!\w){CALL_NAMES}[\s,!.:-]+(?:ну\s+|а\s+|так\s+)?(?:давай|го|пошли|может)\s+(?:уже\s+|с\s+тобой\s+|тогда\s+)?"
@@ -772,9 +841,14 @@ async def c_help(inter: discord.Interaction):
 @tree.command(name="анекдот", description="Рассказать анекдот")
 @app_commands.describe(тема="О чём (необязательно)")
 async def c_joke(inter: discord.Interaction, тема: str = ""):
-    await guarded(inter, say(gid(inter), {inter.user.id: inter.user.display_name},
-                             f"{inter.user.display_name} просит анекдот" + (f" про: {тема}" if тема else " на любую тему")
-                             + ". Расскажи один смешной анекдот, без вступлений."))
+    async def run():
+        joke, on_topic = await jokes.get(gid(inter), тема, nsfw=is_nsfw(inter.channel))
+        if joke:                                 # дословно с сайтов; все лежат — сочиняет модель
+            return (f"про {тема} не нашёл, держи другой\n\n" if тема and not on_topic else "") + joke
+        return await say(gid(inter), {inter.user.id: inter.user.display_name},
+                         f"{inter.user.display_name} просит анекдот" + (f" про: {тема}" if тема else " на любую тему")
+                         + ". Расскажи один смешной анекдот, без вступлений.")
+    await guarded(inter, run())
 
 
 @tree.command(name="совет", description="Совет от бота (полезный, но с наездом)")
@@ -1540,6 +1614,7 @@ async def maintenance_loop():
     log.info("ночное обслуживание")
     await router.discover()
     await consolidate_all()
+    await lexicon_all(force=True)
     memory.backup()
 
 
@@ -1552,6 +1627,87 @@ async def scan_loop():
             except Exception:
                 log.exception("база знаний %s", guild.name)
         await scan_guild(guild)
+    await lexicon_all()                          # первый раз — не дожидаясь ночи
+
+
+# ======================= словарь сервера =======================
+lexicon_cache = {}      # guild_id → данные словаря (из settings)
+
+
+def lexicon(guild_id):
+    if guild_id not in lexicon_cache:
+        try:
+            lexicon_cache[guild_id] = json.loads(store.get(guild_id, "lexicon") or "{}")
+        except ValueError:
+            lexicon_cache[guild_id] = {}
+    return lexicon_cache[guild_id]
+
+
+def lexicon_text(guild_id):
+    """Блок для подсказки: местный сленг, мемы, манера и пара случайных живых фраз людей."""
+    lx = lexicon(guild_id) if guild_id else {}
+    if not lx:
+        return ""
+    out = ["КАК ОБЩАЮТСЯ НА ЭТОМ СЕРВЕРЕ (подстраивайся, словечки — к месту, не в каждом ответе):"]
+    if lx.get("style"):
+        out.append("манера: " + str(lx["style"])[:250])
+    if lx.get("slang"):
+        out.append("сленг: " + "; ".join(map(str, lx["slang"][:20]))[:450])
+    if lx.get("memes"):
+        out.append("мемы: " + "; ".join(map(str, lx["memes"][:8]))[:300])
+    phrases = [str(x) for x in lx.get("phrases") or [] if str(x).strip()]
+    if phrases:
+        out.append("так пишут люди (для тона, не цитируй): " + " / ".join(random.sample(phrases, min(cfg.LEXICON_SHOWN, len(phrases)))))
+    return "\n".join(out)
+
+
+async def build_lexicon(guild):
+    since = datetime.now(TZ) - timedelta(hours=cfg.LEXICON_HOURS)
+    chans = [c for c in guild.text_channels if readable(c) and not is_nsfw(c) and not KB_CHANNEL_RX.search(c.name)]
+    chans.sort(key=lambda c: c.last_message_id or 0, reverse=True)
+    lines, size = [], 0
+    for ch in chans[:8]:
+        try:
+            async for x in ch.history(limit=400, after=since, oldest_first=False):
+                t = x.clean_content.strip()
+                if x.author.bot or not t or t.startswith(("/", "!", "http")) or CALL_RX.match(t):
+                    continue
+                lines.append(t[:200].replace("\n", " "))
+                size += len(lines[-1])
+                if size > cfg.LEXICON_CHARS:
+                    break
+        except discord.HTTPException:
+            continue
+        if size > cfg.LEXICON_CHARS:
+            break
+    if len(lines) < 30:
+        log.info("словарь %s: мало сообщений (%d), пропускаю", guild.name, len(lines))
+        return
+    random.shuffle(lines)
+    old = json.dumps(lexicon(guild.id), ensure_ascii=False)
+    r = await router.complete([{"role": "system", "content": cfg.LEXICON_PROMPT},
+                               {"role": "user", "content": f"Прошлый словарь: {old}\n\nСообщения:\n" + "\n".join(lines)}],
+                              role="extract", max_tokens=900, temperature=0.3, json_mode=True)
+    data = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", (r.get("content") or "").strip()))
+    lx = {k: data.get(k) for k in ("slang", "memes", "style", "phrases") if data.get(k)}
+    if not lx:
+        return
+    store.put(guild.id, "lexicon", json.dumps(lx, ensure_ascii=False))
+    lexicon_cache[guild.id] = lx
+    log.info("словарь %s обновлён: %d словечек, %d мемов, %d фраз (из %d сообщений)", guild.name,
+             len(lx.get("slang") or []), len(lx.get("memes") or []), len(lx.get("phrases") or []), len(lines))
+
+
+async def lexicon_all(force=False):
+    for guild in client.guilds:
+        if not force and lexicon(guild.id):
+            continue
+        if not cap_ok("lexicon"):
+            return
+        try:
+            await build_lexicon(guild)
+        except (RateLimited, ValueError, discord.HTTPException) as e:
+            log.warning("словарь %s не собран: %s", guild.name, e)
 
 
 # ======================= запуск =======================

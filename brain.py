@@ -239,7 +239,8 @@ class Brain:
                 ctx["answer_id"] = row["id"]
                 log.info("запомненный ответ #%s (%.2f): %s", row["id"], score, row["question"][:60])
                 return (f"Ты уже отвечал на похожий вопрос («{row['question']}»), ответ проверен по {row['source']}:\n"
-                        f"{row['answer']}\nЕсли спрашивают то же — ответь так же по сути, своими словами. "
+                        f"{row['answer']}\nЭто только СУТЬ. Если спрашивают то же — передай её заново, другими словами и "
+                        "по-другому построив фразу (формулировку не копируй, свои прошлые шутки оттуда не повторяй). "
                         "Если вопрос про другое — поищи (web_search) или честно скажи, что не знаешь.")
         ver, upd = mc_update(clean_q)
         if not upd and not wiki_words(clean_q):
@@ -283,6 +284,7 @@ class Brain:
             return ("Поиск по этому вопросу ничего не дал. Не придумывай ответ: честно скажи, что не знаешь/не нашёл "
                     "(можно посоветовать глянуть вики или спросить на сервере).")
         ctx["_article"] = bool(mc and article)
+        ctx["_source_text"] = text
         if cacheable and mc and article:         # запоминаем только проверенное по вики (частые вопросы сервера)
             ctx["_grounded"] = (key, clean_q, source)
         return head + text
@@ -294,6 +296,9 @@ class Brain:
         if not g or len(answer) < 20 or UNSURE_RX.search(answer):
             return
         key, question, source = g
+        words, src = qkey(answer), qkey(ctx.get("_source_text", ""))
+        if len(words & src) < max(2, len(words) * 0.3):
+            return                               # подкол вместо ответа («опять без огнестойкости?») — не по статье, не храним
         ctx["answer_id"] = self.store.save_answer(key, question, answer[:1500], source, ANSWER_MATCH, ANSWERS_MAX)
         log.info("запомнил ответ #%s: %s", ctx["answer_id"], question[:60])
 

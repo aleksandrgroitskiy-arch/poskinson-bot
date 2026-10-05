@@ -94,7 +94,43 @@ check("обычное «[» в ответе не трогается", bot.save_f
 print("промпт v2: ядро + блоки")
 config.PROMPT_V2 = True
 hi = bot.persona("пос привет")
-check("на «привет» — только ядро", hi == config.PERSONA_CORE)
+check("на «привет» — только ядро и примеры", hi.startswith(config.PERSONA_CORE) and config.BLOCK_MC not in hi
+      and config.BLOCK_SERVER not in hi and hi.count("\n— ") == config.EXAMPLES_SHOWN)
+check("примеры тона каждый раз разные", len({bot.persona("пос привет") for _ in range(8)}) > 1)
+
+print("повторы")
+bot.recent_said.clear()
+bot.remember_said(1, "о, здарова. чё делаешь, опять в майне сидишь")
+check("почти тот же ответ — повтор", bot.repeats(1, "о здарова, чё делаешь? опять в майне сидишь"))
+check("то же начало — повтор", bot.repeats(1, "о, здарова. как дела вообще"))
+check("другой ответ — не повтор", not bot.repeats(1, "да норм всё, строю базу у реки"))
+check("в другом канале — не повтор", not bot.repeats(2, "о, здарова. чё делаешь, опять в майне сидишь"))
+for i in range(12):
+    bot.remember_said(1, f"реплика номер {i}")
+check("помнит только последние", len(bot.recent_said[1]) == config.RECENT_SAID)
+
+print("анекдоты")
+from jokes import JOKE_RX, topic_of, Jokes
+for t in ("пос расскажи анекдот", "пос анекдот", "пос, анекдот про штирлица", "пос пошути", "знаешь анекдот про крипера?"):
+    check(f"анекдот: {t}", JOKE_RX.search(t))
+for t in ("я пошутил", "пос пошути над ним", "анекдоты тупые", "пос, это анекдот какой-то"):
+    check(f"не анекдот: {t}", not JOKE_RX.search(t))
+check("тема анекдота", topic_of("пос анекдот про штирлица?") == "штирлица")
+import sqlite3 as _sq
+_j = Jokes(_sq.connect(":memory:"))
+check("табу и политика не берутся", not _j.ok("Встречаются как-то чукча и русский, и говорит чукча...", True)
+      and not _j.ok("Путин приходит в магазин и говорит продавцу...", True))
+check("пошлое — только в 18+", not _j.ok("Муж с женой в постели, и тут она говорит про секс...", False)
+      and _j.ok("Муж с женой в постели, и тут она говорит про секс...", True))
+_j.mark(5, "Колобок повесился. Ну и всё, конец анекдота")
+check("рассказанный запомнен", _j.seen(5, "колобок повесился, ну и всё конец анекдота") and not _j.seen(6, "Колобок повесился. Ну и всё, конец анекдота"))
+
+print("словарь сервера")
+bot.store.put(77, "lexicon", '{"slang": ["го — пошли"], "style": "коротко, строчными", "phrases": ["кто на сервак", "ору"]}')
+bot.lexicon_cache.clear()
+lx = bot.lexicon_text(77)
+check("словарь в подсказке", "го — пошли" in lx and "строчными" in lx and ("кто на сервак" in lx or "ору" in lx))
+check("словарь идёт в персону сервера", "го — пошли" in bot.persona("пос привет", guild_id=77) and not bot.lexicon_text(78))
 check("ядро заметно короче старого", len(config.PERSONA_CORE) < len(config.PERSONA) * 0.65,
       f"{len(config.PERSONA_CORE)} vs {len(config.PERSONA)}")
 check("крафт — блок Майнкрафта", config.BLOCK_MC in bot.persona("пос как скрафтить маяк"))
@@ -159,7 +195,7 @@ ctx = {}
 note = asyncio.run(B.prepare_facts("пос как сделать ферму фантомов", True, ctx))
 check("не нашёл — велим сказать «не знаю»", "ничего не дал" in note and "_grounded" not in ctx)
 async def some_wiki(found, question=""):
-    return "[статья «Руководство:Ферма железа»] големы спавнятся у жителей"
+    return "[статья «Руководство:Ферма железа»] големы спавнятся у жителей с кроватями, если рядом зомби; големов сбрасывают в лаву над воронками"
 B.wiki_article = some_wiki
 fake_search.result = "Ферма железа\nhttps://example.org\nголемы спавнятся у жителей"
 ctx = {}
