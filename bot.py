@@ -1669,8 +1669,8 @@ async def build_lexicon(guild):
     for ch in chans[:8]:
         try:
             async for x in ch.history(limit=400, after=since, oldest_first=False):
-                t = x.clean_content.strip()
-                if x.author.bot or not t or t.startswith(("/", "!", "http")) or CALL_RX.match(t):
+                t = re.sub(r"[,!]?\s*" + CALL_RX.pattern + r"[,!]?", " ", x.clean_content, flags=re.I).strip()   # обращение к боту — не речь людей
+                if x.author.bot or len(t) < 2 or t.startswith(("/", "!", "http")):
                     continue
                 lines.append(t[:200].replace("\n", " "))
                 size += len(lines[-1])
@@ -1690,6 +1690,12 @@ async def build_lexicon(guild):
                               role="extract", max_tokens=900, temperature=0.3, json_mode=True)
     data = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", (r.get("content") or "").strip()))
     lx = {k: data.get(k) for k in ("slang", "memes", "style", "phrases") if data.get(k)}
+    for k in ("slang", "memes", "phrases"):     # модели иногда отдают {"слово": "смысл"} вместо строк; повторы — вон
+        items = []
+        for it in lx.get(k) or []:
+            items += [f"{a} — {b}" for a, b in it.items()] if isinstance(it, dict) else [str(it)]
+        seen = set()
+        lx[k] = [x for x in items if x.strip() and not (x.split(" — ")[0].lower() in seen or seen.add(x.split(" — ")[0].lower()))]
     if not lx:
         return
     store.put(guild.id, "lexicon", json.dumps(lx, ensure_ascii=False))
