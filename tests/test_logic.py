@@ -78,6 +78,13 @@ imgs = [bot.image_ok(88) for _ in range(config.IMAGES_PER_USER_HOUR + 1)]
 check(f"картинок не больше {config.IMAGES_PER_USER_HOUR} в час", imgs[-1] is False and all(imgs[:-1]))
 check("помощь новичку распознаётся", bool(bot.HELP_RX.search("а как зайти к вам на сервер?")))
 check("айпи распознаётся", bool(bot.HELP_RX.search("скиньте айпи плз")))
+from brain import SERVER_RX, pick_tools  # noqa: E402
+for q in ("меня загриферили, что делать?", "у меня украли ресы", "слетел приват", "не могу зайти на сервер",
+          "потерял вещи после смерти", "с чего начать новичку", "как поставить дом", "меня забанили", "где карта мира"):
+    check(f"тема сервера: «{q}»", bool(SERVER_RX.search(q)) and "server_info" in {t["function"]["name"] for t in pick_tools(q)})
+for q in ("как дела", "а ты любишь бананы", "расскажи анекдот"):
+    check(f"не тема сервера: «{q}»", not SERVER_RX.search(q))
+check("беда новичка — вклиниваемся сами", bool(bot.HELP_RX.search("меня загриферили?")))
 
 print("18+ картинки")
 from media import forbidden  # noqa: E402

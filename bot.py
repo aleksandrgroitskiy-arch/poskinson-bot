@@ -23,7 +23,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 import config as cfg
-from brain import Brain, RateLimited, fix_script, mc_question, needs_facts, pick_tools
+from brain import SERVER_RX, Brain, RateLimited, fix_script, mc_question, needs_facts, pick_tools
 from jokes import JOKE_RX, Jokes, topic_of
 from config import (CALL_NAMES, CALL_RX, DB_PATH, HISTORY, INTERJECT_COOLDOWN, INTERJECT_NOTE, JUDGE_CHANCE, JUDGE_COOLDOWN,
                     JUDGE_PROMPT, JUDGE_THRESHOLD, LOG_DIR, LOH_HOUR, MAX_PARTS, NAME, PERSONA, QUIZ_SECONDS,
@@ -65,7 +65,13 @@ kb_dirty = set()        # серверы, где в инфо-каналах чт
 recent_said = {}        # channel_id → последние реплики бота (чтобы не повторялся)
 REP_RX = re.compile(r"^\s*(?:-{3,}\s*)?ОТНОШЕНИЕ\s*:\s*([+-−–]?\s*\d)\s*$", re.M | re.I)
 HELP_RX = re.compile(r"как\s+(?:за(?:йти|йду|ходить)|попасть|играть|подать|начать)|айпи|\bip\b|адрес\s+сервера|"
-                     r"заявк|вайтлист|whitelist|правил|какая\s+версия|на\s+какой\s+версии|лаунчер|сборк", re.I)
+                     r"заявк|вайтлист|whitelist|правил|какая\s+версия|на\s+какой\s+версии|лаунчер|сборк|"
+                     # новичку в беде отвечаем сами, даже если не звал (только с «?» — см. on_message)
+                     r"гриф|украл|укр[ао]ли|своровал|воруют|обокрал|обчистил|взломал|снесли|жалоб|пожаловаться|читер|"
+                     r"приват|потерял\w* (?:вещи|ресы|инвентар)|вещи пропал|ресы пропал|вернуть (?:вещи|ресы|постройк)|"
+                     r"с чего начать|что делать новичк|не (?:могу|получается) (?:зайти|войти|подключиться)|"
+                     r"забанил|разбан|как (?:сделать|поставить|настроить) дом|как (?:телепортиро|вернуться на спавн)|"
+                     r"команды сервера|карта (?:мира|сервера)|dynmap|динмап", re.I)
 quizzes = {}            # channel_id → активная викторина
 FACT_RX = re.compile(r"^\s*(?:-{3,}\s*)?ЗАПОМНИ\s*:\s*(.+?)\s*\|\s*(.+?)\s*$", re.M | re.I)
 TIRED = "мана кончилась, дай реген пару минут"
@@ -520,7 +526,7 @@ async def respond(m, called, interject, note=None):
             ref = m.reference.resolved if m.reference else None
             if isinstance(ref, discord.Message):
                 await see_images(ref)
-            msgs, people = await build_prompt(m, interject, with_kb=bool(HELP_RX.search(m.content)) or is_newbie(m.author), note=note)
+            msgs, people = await build_prompt(m, interject, with_kb=bool(HELP_RX.search(m.content) or SERVER_RX.search(m.content)) or is_newbie(m.author), note=note)
             # последние реплики без ников — чтобы «да, как его скрафтить» нашло предмет из прошлого сообщения
             recent = next((x["content"] for x in msgs if x["role"] == "user" and x["content"].startswith("[недавний чат")), "")
             ctx["recent"] = " ".join(line.split(":", 1)[-1] for line in recent.splitlines()[-3:])
@@ -1241,9 +1247,13 @@ async def do_loh(guild):
     store.put(g, "loh_user", uid)
     store.add_score(g, uid, "loh")
     try:
-        roast = await say(g, {uid: name}, f"Сегодня лохом дня выбран {name}. Объясни в 2–4 предложениях, почему именно он — "
-                                          "жёстко и смешно, используя то, что о нём знаешь (если ничего — придумай повод "
-                                          "из его молчания или ника).", max_tokens=300)
+        roast = await say(g, {uid: name}, f"Сегодня лохом дня выбран {name}. Напиши одну цельную прожарку на 2–4 коротких предложения — жёстко и смешно. "
+                                          "Выбери ОДИН самый сильный реальный повод из памяти и раскрути только его: повод → развитие → панч. "
+                                          "Не склеивай несвязанные факты, не перечисляй досье, не перескакивай на новую тему. "
+                                          "Каждая следующая фраза продолжает предыдущую, последняя добивает ту же шутку. "
+                                          "Без пустых концовок вроде «тебе не стыдно?» и «это классика». "
+                                          "Если подходящего факта нет, подшути над ником или самим случайным выбором, без выдуманных событий. "
+                                          "Один абзац, без заголовка и списков.", max_tokens=300)
     except RateLimited:
         roast = "почему — сам знает"
     n = store.score(g, uid, "loh")
